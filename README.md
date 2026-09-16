@@ -285,3 +285,4 @@ Other single-file tools in this portfolio that pair with this one:
 
 - [itemcensus](https://github.com/uhsear/itemcensus) - the enumeration underneath this, including the bisect past the 10,000 search ceiling
 - [sightline](https://github.com/uhsear/sightline) - the same platform from the other side: what a viewer sees today, rather than what changed
+- [ghostsvc](https://github.com/uhsear/ghostsvc) - the services no sharing report can see, because they have no item
