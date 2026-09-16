@@ -20,6 +20,9 @@ PASS  private is the narrowest level
 PASS  public is the widest level
 PASS  group-only sharing is narrower than org-wide
 ...
+PASS  a page that came back short advances by the ten rows it got, not by the hundred it asked for  <-- pinned defect
+PASS  an org whose last page ends one row short of the total is paged to that last row, not stopped one item early  <-- pinned defect
+PASS  the row sitting exactly on the ceiling is still asked for  <-- pinned defect
 PASS  exactly 10,000 cannot be proven complete  <-- pinned defect
 PASS  the warning says the deletions below may not be real  <-- pinned defect
 ...
@@ -27,6 +30,7 @@ PASS  a url with no scheme is refused, because urllib quotes the whole url back 
 ...
 PASS  nine bulk items and one unrelated item are two events, not ten
 PASS  one owner's bulk share collapses to a single event
+PASS  at equal severity the event touching nine items leads the one touching one, even when the owner names sort the other way  <-- pinned defect
 ...
 PASS  a group created public is reported, not only one flipped public  <-- pinned defect
 PASS  items missing from the new snapshot are DELETED  <-- pinned defect
@@ -38,15 +42,40 @@ PASS  a day where everything was deleted is not a clean day  <-- pinned defect
 PASS  a windows console gets a replaced character, not a crash that loses every finding below it  <-- pinned defect
 ...
 PASS  a scheme-less --url is refused before any request is built  <-- pinned defect
+PASS  items as a JSON list is refused, because the diff indexes items by id and would raise TypeError instead  <-- pinned defect
+PASS  paging reads all 250 items, not the 100 the server caps a page at  <-- pinned defect
+PASS  the portal's modified date is carried into the record, not zeroed  <-- pinned defect
+PASS  four items the portal dated ten hours apart stay four events, because the date reached the collapse  <-- pinned defect
+PASS  every call asks for f=json, or the portal answers with the html page and json.loads gets a doctype  <-- pinned defect
+PASS  a server that quietly gives back ten rows for a page of a hundred is still paged to the end of the org  <-- pinned defect
+PASS  an item in two groups gets them back in id order, so an unchanged org writes the same bytes twice  <-- pinned defect
+PASS  the token never reaches the snapshot document  <-- pinned defect
+PASS  the password never appears in a url  <-- pinned defect
+PASS  --username signs in and returns a token  <-- pinned defect
+PASS  a token in the url urllib quoted back is redacted out of the error  <-- pinned defect
+PASS  a token that dies mid-paging fails the snapshot  <-- pinned defect
+PASS  the default opener verifies the certificate  <-- pinned defect
+...
+PASS  a dry run leaves the directory empty  <-- pinned defect
+PASS  the token never reaches stdout  <-- pinned defect
+PASS  no credential reaches the snapshot file on disk  <-- pinned defect
+PASS  a token that died mid-paging writes no half-read snapshot and does not overwrite the one that finished  <-- pinned defect
+PASS  watch diffs against the snapshot that was in --dir before the run, not against the file it just wrote over it  <-- pinned defect
+PASS  the org that was just read is still written when yesterday's file turns out to be corrupt  <-- pinned defect
+PASS  a sharing level this version has never heard of is refused, not sorted as private and called safe  <-- pinned defect
+PASS  an item title a cp1252 console cannot encode is replaced, and the finding still prints  <-- pinned defect
+PASS  --insecure with --username is refused, because that posts the password down an unverified connection  <-- pinned defect
+...
+PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted and two failed portal calls as six failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-125 assertions, 0 failed
+254 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `ssl`, `io`, `argparse`,
-`datetime`, `getpass`. It runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the
-`arcgis` package is not needed.
+`datetime`, `getpass`, and `tempfile` and `shutil` in the self-test. It runs on ArcGIS Pro's
+Python and on a plain `python3`. `arcpy` is not used and the `arcgis` package is not needed.
 
 ```
 git clone https://github.com/uhsear/sharewatch.git
@@ -54,7 +83,10 @@ python sharewatch.py --self-test
 ```
 
 `--self-test` needs no portal, no network and no credentials, so you can check the tool before
-you point it at an organization.
+you point it at an organization. It covers the portal calls as well as the decisions: paging,
+sign-in, the 10,000 row ceiling, an expired token, an HTTP error, a 200 response carrying an
+ArcGIS error envelope, and all three modes end to end are run against a stand-in portal that
+answers inside the process. No socket is opened.
 
 ## Usage
 
@@ -198,6 +230,14 @@ this tool did exactly that and reported a clean day after 60 items were deleted.
 walk the union, and three assertions pin it, including one that a day where everything was
 deleted is not a clean day.
 
+`watch` had a second way of printing the same false clean day. It wrote the fresh snapshot before
+it read the baseline, and a snapshot is named for the second it was taken in. Two runs inside the
+same second produce the same file name, so the write landed on the very file the diff was about
+to read, and the run compared the new snapshot with itself. The baseline is now read into memory
+first, and it is still written afterwards even when yesterday's file turns out to be corrupt,
+because the organization has already been read and throwing that away loses today's evidence
+too.
+
 ## Limits
 
 - It compares snapshots, so it sees nothing before the first one. Start taking them today.
@@ -222,6 +262,9 @@ deleted is not a clean day.
   same item with a different name against it.
 - A sharing level this version does not know stops the diff with exit code 64. Sorting an
   unknown level to `private` would make every item holding it look safe.
+- A file that is not a snapshot stops the diff with exit code 64 as well. `items` and `groups`
+  have to be objects keyed by id, because the diff indexes them by id and a JSON list there
+  used to reach the operator as a `TypeError` traceback.
 - Deleted groups are not reported. The items that were in them report as `item-left-group`.
 
 ## Contributing

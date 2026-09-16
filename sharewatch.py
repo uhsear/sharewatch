@@ -32,8 +32,11 @@ import getpass
 import io
 import json
 import os
+import shutil
 import ssl
 import sys
+import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -704,6 +707,13 @@ def check_snapshot(snapshot, path):
         if key not in snapshot:
             raise ValueError("%s is not a sharewatch snapshot: no %r"
                              % (path, key))
+    for key in ("items", "groups"):
+        # The diff indexes both by id. A file holding them as JSON lists used
+        # to get that far and raise TypeError out of the sort, which reaches
+        # the operator as a traceback rather than as a refusal.
+        if not isinstance(snapshot[key], dict):
+            raise ValueError("%s is not a sharewatch snapshot: %r is not an "
+                             "object keyed by id" % (path, key))
     if not snapshot.get("taken"):
         raise ValueError("%s has an empty 'taken' timestamp" % path)
     return True
@@ -827,11 +837,20 @@ def self_test():
     raises(lambda: clamp_num(0), "a page size of zero raises")
     check(next_start(1, 100, 250) == 101, "the second page starts at 101")
     check(next_start(101, 100, 250) == 201, "the third page starts at 201")
+    check(next_start(1, 10, 250) == 11,
+          "a page that came back short advances by the ten rows it got, not by "
+          "the hundred it asked for  <-- pinned defect")
     check(next_start(201, 50, 250) is None,
           "a page that reaches the total terminates")
     check(next_start(300, 0, 250) is None, "a start past the end terminates")
+    check(next_start(101, 100, 201) == 201,
+          "an org whose last page ends one row short of the total is paged to "
+          "that last row, not stopped one item early  <-- pinned defect")
     check(next_start(9901, 100, 12000) is None,
           "paging stops at the 10,000 ceiling, not at the reported total")
+    check(next_start(9900, 100, 12000) == 10000,
+          "the row sitting exactly on the ceiling is still asked for  "
+          "<-- pinned defect")
     raises(lambda: next_start(0, 10, 100), "a zero start raises, search is 1-based")
     check(is_truncated(9999) is False, "9,999 results is a total we can prove")
     check(is_truncated(10000) is True,
@@ -913,6 +932,24 @@ def self_test():
           "a second owner in the same day stays a separate event")
     check(events[0].owner == "jsmith",
           "the nine-item event outranks the one-item event at equal severity")
+    # jsmith also sorts before kpatel, so the line above passes on the owner
+    # tiebreak alone. These two owners are named so that alphabetical order and
+    # blast radius disagree: only the item count can put the big event first.
+    loud, quiet = "zzz_bulk", "aaa_single"
+    before = {"one": item("one", quiet, "org", day1)}
+    after = {"one": item("one", quiet, "public", day1)}
+    for idx in range(9):
+        iid = "many%d" % idx
+        before[iid] = item(iid, loud, "org", day1 + idx * minute)
+        after[iid] = item(iid, loud, "public", day1 + idx * minute)
+    ranked = diff_snapshots(build_snapshot("u", "t", before, {}, 10, False),
+                            build_snapshot("u", "t", after, {}, 10, False))
+    check([ev.owner for ev in ranked] == [loud, quiet],
+          "at equal severity the event touching nine items leads the one "
+          "touching one, even when the owner names sort the other way  "
+          "<-- pinned defect")
+    check(len(ranked[0].items) == 9 and len(ranked[1].items) == 1,
+          "the leading event is the one with the bigger blast radius")
 
     # ---- the window is a window, not a day
     spread = {}
@@ -1130,6 +1167,695 @@ def self_test():
           "<-- pinned defect")
     check(bad_window == 64, "a negative --window-minutes is refused")
 
+    # ---- the last of the pure core
+    check(abs((utcnow() - datetime.datetime.now(datetime.timezone.utc))
+              .total_seconds()) < 5, "the snapshot clock reads UTC now")
+    check(utcnow().tzinfo is datetime.timezone.utc,
+          "the snapshot clock carries UTC, not a naive local time")
+    check(_bucket([], 60 * 1000) == [], "no findings make no buckets")
+    shown = describe(wiped)
+    check(any("and 40 more" in line for line in shown),
+          "a 60-item event lists 20 items and counts the rest")
+    check(len([line for line in shown if line.startswith("        - ")]) == 21,
+          "the long list is cut at 20 lines plus the count")
+    closed = diff_snapshots(
+        build_snapshot("u", "t", {}, {"g": group("g", "public")}, 0, False),
+        build_snapshot("u", "t", {}, {"g": group("g", "org")}, 0, False))
+    check(len(closed) == 1 and closed[0].kind == "group-narrowed",
+          "a group locked back down is recorded, not alarmed about")
+    check(closed[0].severity < SEVERITY["group-org"],
+          "narrowing a group ranks below widening one")
+    check("item-public" in repr(events[0]) and "jsmith" in repr(events[0]),
+          "an event names its kind and owner when it turns up in a traceback")
+    raises(lambda: check_snapshot({"items": [{"id": "a"}], "groups": {},
+                                   "taken": "t"}, "f"),
+           "items as a JSON list is refused, because the diff indexes items by "
+           "id and would raise TypeError instead  <-- pinned defect")
+    raises(lambda: check_snapshot({"items": {}, "groups": [], "taken": "t"}, "f"),
+           "groups as a JSON list is refused for the same reason")
+
+    # ---- the portal, answered in process
+    #
+    # No socket is opened and no credential is real. _opener is swapped for a
+    # stand-in that answers the REST paths the portal answers, including the
+    # three failures that matter: a 200 carrying an error envelope, which is
+    # how ArcGIS reports a dead token; an HTTP error, which is how a gateway
+    # reports one; and an exception out of urllib that quotes the failing url
+    # back with the token still in it.
+
+    class FakeResponse(object):
+        def __init__(self, body):
+            self.body = body
+
+        def read(self):
+            return json.dumps(self.body).encode("utf-8")
+
+    class FakePortal(object):
+        """A portal that answers in process, from a list of items and groups.
+
+        num is capped at 100 the way the real server silently caps it, so a
+        paging loop that advanced by its own num instead of by the rows it got
+        back would read one page here and call the whole org snapshotted.
+        """
+
+        def __init__(self, items=(), groups=(), org="ORG123", token="TESTTOKEN",
+                     reported_total=None, fail_search_after=None,
+                     open_error=None, cap=100):
+            self.items = list(items)
+            self.groups = list(groups)
+            self.org = org
+            self.token = token
+            self.reported_total = reported_total
+            self.fail_search_after = fail_search_after
+            self.open_error = open_error      # callable(target) -> exception
+            self.cap = cap                    # rows the server will really give
+            self.searches = 0
+            self.targets = []
+            self.posted = []
+            self.insecure = None
+
+        def __call__(self, insecure):         # stands in for _opener(insecure)
+            self.insecure = insecure
+            return self
+
+        def open(self, target, data=None, timeout=None):
+            if data is None:
+                path, _sep, query = target.partition("?")
+            else:
+                path, query = target, data.decode("utf-8")
+                self.posted.append(query)
+            self.targets.append(target)
+            if self.open_error is not None:
+                raise self.open_error(target)
+            return FakeResponse(self._body(path, dict(
+                urllib.parse.parse_qsl(query))))
+
+        def _body(self, path, params):
+            if path.endswith("/generateToken"):
+                if params.get("password") != "hunter2":
+                    return {"error": {"code": 400,
+                                      "message": "Invalid username or password."}}
+                return {"token": self.token, "expires": 9999999999999}
+            if path.endswith("/portals/self"):
+                return {"id": self.org} if self.org else {}
+            if path.endswith("/community/groups"):
+                return self._page(self.groups, params)
+            if path.endswith("/search"):
+                self.searches += 1
+                if (self.fail_search_after is not None
+                        and self.searches > self.fail_search_after):
+                    return {"error": {"code": 498, "message": "Invalid token."}}
+                rows = self.items
+                query = params.get("q") or ""
+                if query.startswith("group:"):
+                    gid = query.split(":", 1)[1]
+                    rows = [r for r in rows if gid in (r.get("_groups") or [])]
+                return self._page(rows, params)
+            return {"error": {"code": 400, "message": "unhandled " + path}}
+
+        def _page(self, rows, params):
+            start = int(params.get("start") or 1)
+            num = min(int(params.get("num") or 10), self.cap)   # silent cap
+            page = rows[start - 1:start - 1 + num]
+            total = (len(rows) if self.reported_total is None
+                     else self.reported_total)
+            return {"total": total, "start": start, "num": len(page),
+                    "results": page}
+
+    def serving(a_portal, fn):
+        """Run fn with that portal answering every call, then put _opener back."""
+        saved_opener = globals()["_opener"]
+        globals()["_opener"] = a_portal
+        try:
+            return fn()
+        finally:
+            globals()["_opener"] = saved_opener
+
+    class Console(io.StringIO):
+        """A stdout that reports an encoding, the way a real console does."""
+        encoding = "utf-8"
+
+    def captured(fn, encoding="utf-8"):
+        """Run fn with stdout and stderr collected. Returns (result, text)."""
+        console = Console()
+        console.encoding = encoding
+        saved_streams = (sys.stdout, sys.stderr)
+        sys.stdout, sys.stderr = console, console
+        try:
+            result = fn()
+        finally:
+            sys.stdout, sys.stderr = saved_streams
+        return result, console.getvalue()
+
+    def fails(fn, label):
+        """A portal call that must raise. Returns the redacted message."""
+        try:
+            fn()
+        except RuntimeError as exc:
+            check(True, label)
+            return "%s" % exc
+        except Exception as exc:
+            check(False, "%s (wrong exception %r)" % (label, exc))
+        else:
+            check(False, "%s (no error raised)" % label)
+        return ""
+
+    PORTAL = "https://county.maps.arcgis.com"
+    catalog = [{"id": "p%03d" % n, "title": "Layer %d" % n, "owner": "jsmith",
+                "type": "Feature Service", "access": "org", "modified": day1 + n,
+                "_groups": ["g-works"] if n < 3 else []} for n in range(250)]
+    portal_groups = [{"id": "g-works", "title": "Public Works",
+                      "owner": "gis_admin", "access": "org",
+                      "membershipAccess": None}]
+    portal = FakePortal(catalog, portal_groups)
+
+    read, reported, cut_short = serving(portal, lambda: search_items(
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    check(len(read) == 250,
+          "paging reads all 250 items, not the 100 the server caps a page at  "
+          "<-- pinned defect")
+    check(portal.searches == 3, "250 items are read in three pages")
+    check(reported == 250 and cut_short is False,
+          "the reported total travels back with the items, not truncated")
+    check(read["p249"]["title"] == "Layer 249",
+          "the last item of the last page is in the snapshot, not lost")
+    check(read["p000"]["groups"] == [],
+          "an item arrives from search with no group membership yet")
+    check(read["p249"]["modified"] == day1 + 249,
+          "the portal's modified date is carried into the record, not zeroed  "
+          "<-- pinned defect")
+    # The collapse buckets on that date, so a record that lost it would merge
+    # a year of unrelated changes into one event and call it one mistake.
+    slow = [dict(row, modified=day1 + n * 600 * minute)
+            for n, row in enumerate(catalog[:4])]
+    was_narrow = serving(FakePortal(slow, []), lambda: take_snapshot(
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    went_public = serving(
+        FakePortal([dict(row, access="public") for row in slow], []),
+        lambda: take_snapshot(PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    check(len(diff_snapshots(was_narrow, went_public)) == 4,
+          "four items the portal dated ten hours apart stay four events, "
+          "because the date reached the collapse  <-- pinned defect")
+    check(all("token=TESTTOKEN" in t for t in portal.targets),
+          "the token is sent with every page")
+    check(all("num=100" in t for t in portal.targets),
+          "the page size is clamped to the server cap before it is sent")
+    check(all("f=json" in t for t in portal.targets),
+          "every call asks for f=json, or the portal answers with the html "
+          "page and json.loads gets a doctype  <-- pinned defect")
+
+    dribbling = FakePortal(catalog, portal_groups, cap=10)
+    dribbled = serving(dribbling, lambda: search_items(
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))[0]
+    check(len(dribbled) == 250,
+          "a server that quietly gives back ten rows for a page of a hundred is "
+          "still paged to the end of the org  <-- pinned defect")
+    check(dribbling.searches == 25,
+          "paging advanced by the rows that came back, twenty five times, not "
+          "by the page size it asked for")
+
+    progress = []
+    serving(portal, lambda: search_items(PORTAL, "orgid:ORG123", "TESTTOKEN",
+                                         echo=progress.append))
+    check(len(progress) == 3 and "250 of 250" in progress[-1],
+          "the progress echo counts the items read against the total")
+
+    anonymous = FakePortal(catalog[:5], portal_groups)
+    serving(anonymous, lambda: search_items(PORTAL, "orgid:ORG123", None))
+    check(not any("token=" in t for t in anonymous.targets),
+          "an anonymous read sends no token parameter at all")
+
+    read_groups = serving(portal, lambda: search_groups(PORTAL, "orgid:ORG123",
+                                                        "TESTTOKEN"))
+    check(list(read_groups) == ["g-works"], "the org's groups are read")
+    check(read_groups["g-works"]["membershipAccess"] == "org",
+          "a null membershipAccess from the portal is read back as org")
+
+    attached = serving(portal, lambda: attach_groups(PORTAL, read, read_groups,
+                                                     "TESTTOKEN"))
+    check(attached["p000"]["groups"] == ["g-works"],
+          "an item inside a group is recorded as being inside it")
+    check(attached["p200"]["groups"] == [],
+          "an item in no group keeps an empty group list")
+    check(sum(1 for i in attached.values() if i["groups"]) == 3,
+          "only the three items that are in the group got the group")
+    pair = [{"id": "both", "title": "In Two", "owner": "jsmith",
+             "type": "Feature Service", "access": "org", "modified": day1,
+             "_groups": ["g-zulu", "g-alpha"]}]
+    two_groups = [{"id": gid, "title": gid, "owner": "gis_admin",
+                   "access": "org", "membershipAccess": None}
+                  for gid in ("g-zulu", "g-alpha")]
+    paired = FakePortal(pair, two_groups)
+    in_two = serving(paired, lambda: take_snapshot(PORTAL, "orgid:ORG123",
+                                                   "TESTTOKEN"))
+    check(in_two["items"]["both"]["groups"] == ["g-alpha", "g-zulu"],
+          "an item in two groups gets them back in id order, so an unchanged "
+          "org writes the same bytes twice  <-- pinned defect")
+    stray = serving(portal, lambda: search_items(
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))[0]
+    del stray["p001"]
+    serving(portal, lambda: attach_groups(PORTAL, stray, read_groups, "TESTTOKEN"))
+    check("p001" not in stray and stray["p000"]["groups"] == ["g-works"],
+          "a group member the org search never returned is skipped, not "
+          "invented as an item with no fields")
+
+    whole = serving(portal, lambda: take_snapshot(PORTAL, "orgid:ORG123",
+                                                  "TESTTOKEN"))
+    check(len(whole["items"]) == 250 and len(whole["groups"]) == 1,
+          "a snapshot holds every item and every group the portal reported")
+    check("TESTTOKEN" not in json.dumps(whole),
+          "the token never reaches the snapshot document  <-- pinned defect")
+    check(check_snapshot(whole, "portal") is True,
+          "a snapshot built from the portal passes the snapshot check")
+    check(whole["url"] == PORTAL and whole["taken"].endswith("Z"),
+          "the snapshot records which portal it came from and when")
+
+    check(serving(portal, lambda: org_id(PORTAL, "TESTTOKEN")) == "ORG123",
+          "the org id is read from portals/self")
+    check(serving(FakePortal(org=None), lambda: org_id(PORTAL, None)) is None,
+          "a portal that will not name its org gives no id, not a wrong one")
+    blind = FakePortal(org=None)
+    serving(blind, lambda: org_id(PORTAL, None))
+    check(not any("token=" in t for t in blind.targets),
+          "portals/self is asked anonymously when there is no token")
+
+    # ---- the credential, which must never be printed, logged or stored
+    check(serving(portal, lambda: generate_token(PORTAL, "gis_admin",
+                                                 "hunter2")) == "TESTTOKEN",
+          "a username and password are exchanged for a token")
+    check(any("password=hunter2" in body for body in portal.posted),
+          "the password goes in the POST body, which is where it belongs")
+    check(not any("password" in t for t in portal.targets),
+          "the password never appears in a url  <-- pinned defect")
+    check(all("f=json" in body for body in portal.posted),
+          "the POST body asks for f=json too, not only the GETs")
+    refused = fails(lambda: serving(portal, lambda: generate_token(
+        PORTAL, "gis_admin", "wrongpass")),
+        "a rejected sign-in is raised, not returned as a token")
+    check("Invalid username or password" in refused,
+          "the portal's own reason survives into the error  <-- pinned defect")
+    check("wrongpass" not in refused,
+          "the rejected password is not quoted back in the error")
+    fails(lambda: serving(FakePortal(token=None), lambda: generate_token(
+        PORTAL, "gis_admin", "hunter2")),
+        "a sign-in that returns no token is an error, not an anonymous read")
+
+    # SHAREWATCH_PASSWORD is borrowed below. A value is seeded first, so that
+    # putting it back is exercised here rather than only on a machine where
+    # the operator happens to have one set already.
+    os.environ[SECRET_ENV] = "the operator's own value"
+    saved_secret = os.environ.pop(SECRET_ENV)
+    try:
+        os.environ[SECRET_ENV] = "from-the-environment"
+        check(read_secret("gis_admin") == "from-the-environment",
+              "the password is read from the environment, never from argv")
+        del os.environ[SECRET_ENV]
+        prompts = []
+
+        def fake_getpass(prompt):
+            prompts.append(prompt)
+            return "typed-at-the-prompt"
+
+        real_getpass, getpass.getpass = getpass.getpass, fake_getpass
+        try:
+            check(read_secret("gis_admin") == "typed-at-the-prompt",
+                  "with nothing in the environment the password is prompted for")
+        finally:
+            getpass.getpass = real_getpass
+        check(bool(prompts) and "gis_admin" in prompts[0]
+              and "not echoed" in prompts[0],
+              "the prompt names the user and says the password is not echoed")
+
+        check(_authenticate(_parse(["snapshot", "--url", PORTAL,
+                                    "--token", "T0KEN"])) == "T0KEN",
+              "an existing --token is used as given, with no sign-in")
+        check(_authenticate(_parse(["snapshot", "--url", PORTAL])) is None,
+              "with no credential at all the read is anonymous")
+        os.environ[SECRET_ENV] = "hunter2"
+        signed_in = FakePortal(catalog[:5], portal_groups)
+        check(serving(signed_in, lambda: _authenticate(_parse(
+            ["snapshot", "--url", PORTAL, "--username", "gis_admin"])))
+            == "TESTTOKEN",
+            "--username signs in and returns a token  <-- pinned defect")
+        check(bool(signed_in.posted)
+              and "username=gis_admin" in signed_in.posted[0],
+              "the sign-in names the user it was asked for")
+    finally:
+        os.environ[SECRET_ENV] = saved_secret
+    check(os.environ.get(SECRET_ENV) == "the operator's own value",
+          "the borrowed %s is put back, not eaten" % SECRET_ENV)
+    del os.environ[SECRET_ENV]
+
+    # ---- the three ways a portal call fails
+    quoted = fails(lambda: serving(
+        FakePortal(open_error=lambda t: ValueError("unknown url type: %r" % t)),
+        lambda: search_items(PORTAL, "orgid:ORG123", "SECRETTOKEN")),
+        "a url urllib cannot open is raised as an error")
+    check("SECRETTOKEN" not in quoted,
+          "a token in the url urllib quoted back is redacted out of the error  "
+          "<-- pinned defect")
+    check(REDACTED in quoted, "the redaction leaves its mark where the token was")
+    gateway = fails(lambda: serving(
+        FakePortal(open_error=lambda t: urllib.error.HTTPError(
+            t, 500, "Internal Server Error", {}, None)),
+        lambda: search_items(PORTAL, "orgid:ORG123", "TESTTOKEN")),
+        "an HTTP error from the portal is raised as an error")
+    check("500" in gateway, "the HTTP status is kept in the error")
+    envelope = fails(lambda: serving(
+        FakePortal(catalog, portal_groups, fail_search_after=1),
+        lambda: search_items(PORTAL, "orgid:ORG123", "TESTTOKEN")),
+        "a 200 response carrying an ArcGIS error envelope is an error, not data")
+    check("498" in envelope and "Invalid token" in envelope,
+          "the portal's error code and message reach the operator")
+    unknown_path = fails(
+        lambda: serving(portal, lambda: _call(PORTAL, "content/items/x99", {})),
+        "an error envelope from any endpoint raises, not only from search")
+    check("content/items/x99" in unknown_path,
+          "the error names the endpoint that failed")
+    expiring = FakePortal(catalog, portal_groups, fail_search_after=1)
+    fails(lambda: serving(expiring, lambda: take_snapshot(
+        PORTAL, "orgid:ORG123", "TESTTOKEN")),
+        "a token that dies mid-paging fails the snapshot  <-- pinned defect")
+    check(expiring.searches == 2,
+          "the half-read org is abandoned at the failing page, not returned")
+
+    # ---- --insecure, which is off unless it is asked for
+    def verify_modes(opener):
+        return [h._context.verify_mode for h in opener.handlers
+                if getattr(h, "_context", None) is not None]
+
+    check(ssl.CERT_NONE in verify_modes(_opener(True)),
+          "--insecure builds an opener that does not verify the certificate")
+    check(ssl.CERT_NONE not in verify_modes(_opener(False)),
+          "the default opener verifies the certificate  <-- pinned defect")
+    check(all(h._context.check_hostname is False
+              for h in _opener(True).handlers
+              if getattr(h, "_context", None) is not None),
+          "--insecure stops the hostname check too, or TLS refuses first")
+
+    # ---- the command line, end to end, against the portal that answers in
+    # process. Every run is captured, so the assertions can read what an
+    # operator would have seen, and prove what is not in it.
+    workdir = tempfile.mkdtemp(prefix="sharewatch-selftest-")
+    try:
+        def put(name, snapshot):
+            path = os.path.join(workdir, name)
+            with io.open(path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(snapshot))
+            return path
+
+        def snapshots_in(directory):
+            if not os.path.isdir(directory):
+                return []
+            return sorted(n for n in os.listdir(directory)
+                          if n.startswith(SNAPSHOT_PREFIX))
+
+        small = catalog[:5]
+        live = FakePortal(small, portal_groups)
+        code, seen = captured(lambda: serving(live, lambda: main(
+            ["snapshot", "--url", PORTAL, "--token", "SECRETTOKEN",
+             "--out", workdir])))
+        check(code == 0, "a snapshot run that read the org exits 0")
+        check("query: orgid:ORG123" in seen,
+              "with no --query the org id is resolved and searched on")
+        check("5 item(s), 1 group(s)" in seen,
+              "the run says how much of the org it read")
+        check("No snapshot was written" in seen,
+              "without --apply nothing is written and the run says so")
+        check(snapshots_in(workdir) == [],
+              "a dry run leaves the directory empty  <-- pinned defect")
+        check("SECRETTOKEN" not in seen,
+              "the token never reaches stdout  <-- pinned defect")
+        check(live.insecure is False,
+              "a run without --insecure verifies the certificate")
+
+        code, seen = captured(lambda: serving(live, lambda: main(
+            ["snapshot", "--url", PORTAL, "--token", "SECRETTOKEN",
+             "--out", workdir, "--apply"])))
+        written = snapshots_in(workdir)
+        check(code == 0 and len(written) == 1, "--apply writes one snapshot file")
+        check("wrote " in seen, "the run says where it wrote the snapshot")
+        with io.open(os.path.join(workdir, written[0]),
+                     encoding="utf-8") as handle:
+            on_disk = handle.read()
+        check("SECRETTOKEN" not in on_disk and "password" not in on_disk,
+              "no credential reaches the snapshot file on disk  <-- pinned defect")
+        check(len(json.loads(on_disk)["items"]) == 5,
+              "the file that was written holds the items that were read")
+
+        unverified = FakePortal(small, portal_groups)
+        captured(lambda: serving(unverified, lambda: main(
+            ["snapshot", "--url", PORTAL, "--insecure"])))
+        check(unverified.insecure is True,
+              "--insecure reaches the opener, it is not only parsed")
+        verified = FakePortal(small, portal_groups)
+        captured(lambda: serving(verified, lambda: main(
+            ["snapshot", "--url", PORTAL])))
+        check(verified.insecure is False, "--insecure stays off unless asked for")
+
+        explicit = FakePortal(small, portal_groups)
+        code, seen = captured(lambda: serving(explicit, lambda: main(
+            ["snapshot", "--url", PORTAL, "--query", "owner:jsmith"])))
+        check(code == 0 and "query: owner:jsmith" in seen,
+              "an explicit --query is used as given")
+        check(not any("portals/self" in t for t in explicit.targets),
+              "with --query the org is never asked to name itself")
+
+        at_ceiling = FakePortal(catalog, portal_groups,
+                                reported_total=SEARCH_CEILING)
+        code, seen = captured(lambda: serving(at_ceiling, lambda: main(
+            ["snapshot", "--url", PORTAL])))
+        check("reached the 10000 row ceiling" in seen,
+              "a snapshot that hit the ceiling warns that it is partial")
+        check("Narrow --query" in seen, "the ceiling warning says what to do")
+
+        code, seen = captured(lambda: serving(FakePortal(org=None), lambda: main(
+            ["snapshot", "--url", PORTAL])))
+        check(code == 2 and "pass --query" in seen,
+              "a portal that will not name its org fails with advice, not a crash")
+        code, seen = captured(lambda: serving(
+            FakePortal(open_error=lambda t: ValueError("unknown url type: %r" % t)),
+            lambda: main(["snapshot", "--url", PORTAL, "--token", "SECRETTOKEN"])))
+        check(code == 2, "a portal that cannot be reached exits 2, not 0")
+        check("SECRETTOKEN" not in seen,
+              "the token is not in the error the failed run printed  "
+              "<-- pinned defect")
+        code, seen = captured(lambda: serving(
+            FakePortal(catalog, portal_groups, fail_search_after=1),
+            lambda: main(["snapshot", "--url", PORTAL, "--out", workdir,
+                          "--apply"])))
+        with io.open(os.path.join(workdir, written[0]),
+                     encoding="utf-8") as handle:
+            after_failure = handle.read()
+        check(code == 2 and snapshots_in(workdir) == written
+              and after_failure == on_disk,
+              "a token that died mid-paging writes no half-read snapshot and "
+              "does not overwrite the one that finished  <-- pinned defect")
+
+        # watch: a fresh read against the newest file already in the directory
+        watched = os.path.join(workdir, "watched")
+        check(snapshots_in(watched) == [],
+              "the watch directory holds nothing before the first run")
+        code, seen = captured(lambda: serving(
+            FakePortal(small, portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", watched, "--apply"])))
+        check(code == 0 and "the baseline" in seen,
+              "the first watch run has nothing to compare with and says so")
+        check(len(snapshots_in(watched)) == 1,
+              "the first watch run wrote the baseline it will compare with")
+        opened_up = [dict(row, access="public") for row in small]
+        code, seen = captured(lambda: serving(
+            FakePortal(opened_up, portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", watched, "--apply"])))
+        check(code == 1, "a watch run that found a widening exits 1")
+        check("item-public" in seen and "5 item(s) by jsmith" in seen,
+              "the watch report names what widened and who widened it")
+        check("baseline: " in seen, "the watch report names the file it used")
+        code, seen = captured(lambda: serving(
+            FakePortal(opened_up, portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", watched])))
+        check(code == 0 and "No sharing changes" in seen,
+              "a watch run against an unchanged org exits 0")
+        check("No snapshot was written" in seen,
+              "watch without --apply writes nothing either")
+
+        empty_dir = os.path.join(workdir, "empty")
+        os.makedirs(empty_dir)
+        code, seen = captured(lambda: serving(
+            FakePortal(small, portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", empty_dir])))
+        check(code == 0 and "the baseline" in seen,
+              "a watch directory that exists but holds no snapshot is a "
+              "baseline run, not a diff against nothing")
+        code, seen = captured(lambda: serving(
+            FakePortal(open_error=lambda t: ValueError("unknown url type: %r" % t)),
+            lambda: main(["watch", "--url", PORTAL, "--dir", watched,
+                          "--token", "SECRETTOKEN"])))
+        check(code == 2 and "SECRETTOKEN" not in seen,
+              "a watch run against an unreachable portal exits 2 and prints "
+              "no token  <-- pinned defect")
+
+        # A second run inside the same second writes the baseline's own name.
+        # The clock is pinned here so that collision is certain rather than
+        # likely: the baseline has to be read before the new file lands on it.
+        collide = os.path.join(workdir, "collide")
+        os.makedirs(collide)
+        pinned_clock = datetime.datetime(2026, 9, 15, 6, 0, 0,
+                                         tzinfo=datetime.timezone.utc)
+        real_clock = globals()["utcnow"]
+        globals()["utcnow"] = lambda: pinned_clock
+        try:
+            with io.open(os.path.join(collide, snapshot_name(pinned_clock)), "w",
+                         encoding="utf-8") as handle:
+                handle.write(json.dumps(build_snapshot(
+                    PORTAL, "2026-09-14T06:00:00Z",
+                    {r["id"]: item(r["id"], "jsmith", "org", day1)
+                     for r in small}, {}, 5, False)))
+            code, seen = captured(lambda: serving(
+                FakePortal(opened_up, portal_groups),
+                lambda: main(["watch", "--url", PORTAL, "--dir", collide,
+                              "--apply"])))
+        finally:
+            globals()["utcnow"] = real_clock
+        check(code == 1 and "5 item(s) by jsmith" in seen,
+              "watch diffs against the snapshot that was in --dir before the "
+              "run, not against the file it just wrote over it  "
+              "<-- pinned defect")
+
+        corrupt = os.path.join(workdir, "corrupt")
+        os.makedirs(corrupt)
+        with io.open(os.path.join(corrupt, "sharewatch-20260101T000000Z.json"),
+                     "w", encoding="utf-8") as handle:
+            handle.write("{ not json")
+        code, seen = captured(lambda: serving(
+            FakePortal(small, portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", corrupt, "--apply"])))
+        check(code == 64 and "error:" in seen,
+              "a corrupt baseline is a usage error, not a traceback")
+        check(len(snapshots_in(corrupt)) == 2,
+              "the org that was just read is still written when yesterday's "
+              "file turns out to be corrupt  <-- pinned defect")
+
+        # diff: two files on disk
+        older = put("day1.json", OLD)
+        newer = put("day2.json", NEW)
+        code, seen = captured(lambda: main(["diff", older, newer]))
+        check(code == 1, "a diff with findings exits 1")
+        check(seen.startswith("\n2026-09-14T06:00:00Z  ->  2026-09-15T06:00:00Z"),
+              "the diff header says which two mornings it compared")
+        check("item-public" in seen and "9 item(s) by jsmith" in seen,
+              "the collapsed bulk share is what the report leads with")
+        code, seen = captured(lambda: main(["diff", older, older]))
+        check(code == 0 and "No sharing changes" in seen,
+              "a quiet diff exits 0 and says so in one line")
+        spread_old = put("spread1.json", wide_old)
+        spread_new = put("spread2.json", wide_new)
+        code, seen = captured(lambda: main(["diff", spread_old, spread_new]))
+        check(code == 1 and seen.count("item-public") == 9,
+              "nine widenings days apart print as nine events")
+        code, seen = captured(lambda: main(["diff", spread_old, spread_new,
+                                            "--window-minutes", "100000"]))
+        check(seen.count("item-public") == 1,
+              "--window-minutes reaches the collapse from the command line")
+        code, seen = captured(lambda: main(
+            ["diff", older, os.path.join(workdir, "no-such-file.json")]))
+        check(code == 64 and "error:" in seen,
+              "a missing snapshot file is a usage error, not a traceback")
+        code, seen = captured(lambda: main(
+            ["diff", older, put("listy.json", {"items": [{"id": "a"}],
+                                               "groups": {}, "taken": "t"})]))
+        check(code == 64,
+              "a file whose items are a JSON list is refused before the diff "
+              "indexes them by id  <-- pinned defect")
+        unknown_level = put("future.json", build_snapshot(
+            "u", "2026-09-16T06:00:00Z",
+            {"bulk1": item("bulk1", "jsmith", "everyone", day1)}, {}, 1, False))
+        code, seen = captured(lambda: main(["diff", older, unknown_level]))
+        check(code == 64 and "does not know" in seen,
+              "a sharing level this version has never heard of is refused, not "
+              "sorted as private and called safe  <-- pinned defect")
+        code, seen = captured(lambda: main(
+            ["diff", put("cut.json", build_snapshot(
+                "u", "2026-09-14T06:00:00Z", {}, {}, SEARCH_CEILING, True)),
+             newer]))
+        check("WARNING" in seen and "artefact" in seen,
+              "diffing a truncated snapshot warns before the findings")
+
+        wide_char = chr(0x6c34)
+        plain = put("ascii.json", build_snapshot(
+            "u", "2026-09-14T06:00:00Z",
+            {"w": item("w", "kpatel", "org", day1, title=wide_char + " Basin")},
+            {}, 1, False))
+        widened_title = put("wide.json", build_snapshot(
+            "u", "2026-09-15T06:00:00Z",
+            {"w": item("w", "kpatel", "public", day1, title=wide_char + " Basin")},
+            {}, 1, False))
+        code, seen = captured(lambda: main(["diff", plain, widened_title]),
+                              encoding="cp1252")
+        check(code == 1 and wide_char not in seen and "? Basin" in seen,
+              "an item title a cp1252 console cannot encode is replaced, and "
+              "the finding still prints  <-- pinned defect")
+        code, seen = captured(lambda: main(["diff", plain, widened_title]),
+                              encoding="utf-8")
+        check(wide_char in seen,
+              "a console that can encode the title gets the real title")
+
+        # the usage errors that never reach the portal
+        code, seen = captured(lambda: main([]))
+        check(code == 64 and "a mode is required" in seen,
+              "no mode at all is a usage error that names the modes")
+        code, seen = captured(lambda: main(["diff", older]))
+        check(code == 64 and "exactly two" in seen,
+              "diff with one file is a usage error")
+        code, seen = captured(lambda: main(["snapshot"]))
+        check(code == 64 and "--url is required" in seen,
+              "snapshot with no --url is a usage error")
+        code, seen = captured(lambda: main(
+            ["snapshot", "--url", PORTAL, "--apply"]))
+        check(code == 64 and "--apply needs --out" in seen,
+              "--apply with nowhere to write is a usage error")
+        code, seen = captured(lambda: main(["watch", "--url", PORTAL]))
+        check(code == 64 and "watch needs --dir" in seen,
+              "watch with no --dir is a usage error")
+        code, seen = captured(lambda: main(
+            ["snapshot", "--url", PORTAL, "--insecure",
+             "--username", "gis_admin"]))
+        check(code == 64 and "unverified connection" in seen,
+              "--insecure with --username is refused, because that posts the "
+              "password down an unverified connection  <-- pinned defect")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    # ---- the harness itself, which has to be able to report red
+    #
+    # A self-test whose failure path is never exercised is not a control: it
+    # reports green because nothing ever calls the other branch. The harness is
+    # run here against six deliberate failures, with its output swallowed and
+    # its tally put back, so that a green run has still proven it can go red.
+    def probe():
+        check(False, "a false check must be recorded as a failure")
+        raises(lambda: None, "a function that raises nothing must fail")
+        raises(lambda: 1 / 0, "a function that raises the wrong thing must fail")
+        refuses(["--self-test"], "an argv argparse accepts must fail")
+        return [fails(lambda: None, "a call that does not raise must fail"),
+                fails(lambda: 1 / 0, "a call that raises the wrong thing must fail")]
+
+    kept_passed, kept_failed = passed[0], list(failed)
+    returned, noise = captured(probe)
+    probe_passed, probe_failed = passed[0], list(failed)
+    passed[0], failed[:] = kept_passed, kept_failed
+    check(len(probe_failed) - len(kept_failed) == 6,
+          "the harness records a false check, a missing exception, a wrong "
+          "exception, an argv argparse accepted and two failed portal calls "
+          "as six failures, so a broken tool turns this self-test red  "
+          "<-- pinned defect")
+    check(probe_passed == kept_passed,
+          "not one of those six was counted as a pass")
+    check(noise.count("FAIL  ") == 6,
+          "every recorded failure prints a FAIL line the operator can see")
+    check(returned == ["", ""],
+          "a portal call that did not raise yields no message to assert on")
+
     print("-" * 68)
     total = passed[0] + len(failed)
     if failed:
@@ -1318,16 +2044,26 @@ def main(argv=None):
     except RuntimeError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
+    # The baseline is read before the fresh snapshot is written, because two
+    # runs inside the same second produce the same file name and the write
+    # lands on the very file this diff is against. Reading it afterwards
+    # compared the new snapshot with itself and reported a clean day.
+    baseline, unreadable = None, None
+    if previous:
+        try:
+            baseline = load_snapshot(previous)
+        except (IOError, OSError, ValueError) as exc:
+            unreadable = exc
     _write(snapshot, args.dir, args.apply)
-    if not previous:
+    if unreadable is not None:
+        # Written first: the org has already been read, and throwing that away
+        # because yesterday's file is corrupt loses today's evidence as well.
+        print("error: %s" % unreadable, file=sys.stderr)
+        return 64
+    if baseline is None:
         print("\nNo earlier snapshot in %s. This one is the baseline." % args.dir)
         return 0
     print("\nbaseline: %s" % previous)
-    try:
-        baseline = load_snapshot(previous)
-    except (IOError, OSError, ValueError) as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        return 64
     return _report(baseline, snapshot, args.window_minutes)
 
 
