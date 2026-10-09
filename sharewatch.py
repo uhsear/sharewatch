@@ -1156,6 +1156,9 @@ def self_test():
     refuses(["snapshot", "--url", "x", "--unshare", "abc"],
             "there is no flag that changes sharing")
     refuses(["publish", "--url", "x"], "an unknown mode is refused")
+    refuses(["snapshot", "--url", "x", "--ap"],
+            "a unique prefix of --apply is refused, so the write flag is never "
+            "reached by abbreviation  <-- pinned defect")
     quiet_err, sys.stderr = sys.stderr, io.StringIO()
     try:
         scheme_less = main(["snapshot", "--url", "county.maps.arcgis.com"])
@@ -1872,6 +1875,7 @@ def self_test():
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="sharewatch.py",
+        allow_abbrev=False,
         description="Diff an ArcGIS organization's sharing posture against "
                     "yesterday, because the platform keeps no audit log.",
         epilog="Read-only. There is no flag that changes sharing. The password "

@@ -41,6 +41,7 @@ PASS  a day where everything was deleted is not a clean day  <-- pinned defect
 ...
 PASS  a windows console gets a replaced character, not a crash that loses every finding below it  <-- pinned defect
 ...
+PASS  a unique prefix of --apply is refused, so the write flag is never reached by abbreviation  <-- pinned defect
 PASS  a scheme-less --url is refused before any request is built  <-- pinned defect
 PASS  items as a JSON list is refused, because the diff indexes items by id and would raise TypeError instead  <-- pinned defect
 PASS  paging reads all 250 items, not the 100 the server caps a page at  <-- pinned defect
@@ -68,7 +69,7 @@ PASS  --insecure with --username is refused, because that posts the password dow
 ...
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted and two failed portal calls as six failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-254 assertions, 0 failed
+255 assertions, 0 failed
 ```
 
 ## Requirements
