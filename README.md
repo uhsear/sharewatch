@@ -1,11 +1,20 @@
 # sharewatch
 
 Diff your ArcGIS organization's sharing posture against yesterday, because the platform keeps no
-audit log. Read-only, never changes sharing.
+audit log. Read-only, never changes sharing. The `mirror` mode does the same comparison between
+two portals, for the day after a cutover.
 
 An internal layer holding addresses with occupant names is public. A resident found it and
 called. Somebody shared a folder to Everyone last week to fix a colleague's access problem, and
 did not look at what else was in that folder.
+
+A different morning, after a migration. The script that copied the items to the new portal shared
+each one the way its twin was shared on the old portal, and logged "done" for every call, because
+every call answered HTTP 200. Some of those answers carried a `notSharedWith` list. Other calls
+were sent with an empty `groups` value, because the group lookup had come up empty, and those
+answered 200 too. Nobody read the lists. A week later the staff who used a planning layer could not
+open it, and a layer that was org-only on the old portal was public on the new one. The `mirror`
+mode reads what each portal holds and reports the difference, instead of trusting the log.
 
 ArcGIS Online has no sharing audit log. The portal will tell you the layer is public right now,
 and nothing else: not when it changed, not who changed it, not what else moved with it. The
@@ -67,15 +76,29 @@ PASS  a sharing level this version has never heard of is refused, not sorted as 
 PASS  an item title a cp1252 console cannot encode is replaced, and the finding still prints  <-- pinned defect
 PASS  --insecure with --username is refused, because that posts the password down an unverified connection  <-- pinned defect
 ...
+PASS  a --new-url on another host than --verify-host is refused  <-- pinned defect
+PASS  an --old-url on the verified host is refused, or the run compares the new portal with itself  <-- pinned defect
+PASS  two items made public by one owner are one event even when their dates are a week apart  <-- pinned defect
+PASS  a 200 that names groups in notSharedWith is a finding, not a success  <-- pinned defect
+PASS  a prefix of --apply is refused on the mirror mode too  <-- pinned defect
+PASS  a pinned call refuses a redirect to another host  <-- pinned defect
+PASS  a token for one portal is never sent to the other  <-- pinned defect
+PASS  a host refusal is made before any request is sent  <-- pinned defect
+PASS  a new url that answers but declares another host is refused, so a DNS alias left on the old portal is caught  <-- pinned defect
+...
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted and two failed portal calls as six failures, so a broken tool turns this self-test red  <-- pinned defect
+...
+PASS  a failed tally lists the failure and exits 1  <-- pinned defect
+PASS  importing the file runs nothing and does not exit
 --------------------------------------------------------------------
-255 assertions, 0 failed
+356 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `ssl`, `io`, `argparse`,
-`datetime`, `getpass`, and `tempfile` and `shutil` in the self-test. It runs on ArcGIS Pro's
+`datetime`, `getpass`, and `tempfile`, `shutil`, `http.server`, `socketserver`, `threading`,
+`contextlib` and `runpy` in the self-test. It runs on ArcGIS Pro's
 Python and on a plain `python3`. `arcpy` is not used and the `arcgis` package is not needed.
 
 ```
@@ -86,8 +109,15 @@ python sharewatch.py --self-test
 `--self-test` needs no portal, no network and no credentials, so you can check the tool before
 you point it at an organization. It covers the portal calls as well as the decisions: paging,
 sign-in, the 10,000 row ceiling, an expired token, an HTTP error, a 200 response carrying an
-ArcGIS error envelope, and all three modes end to end are run against a stand-in portal that
-answers inside the process. No socket is opened.
+ArcGIS error envelope, and the `snapshot`, `diff` and `watch` modes end to end are run against a
+stand-in portal that answers inside the process.
+
+The `mirror` mode is run against `http.server` on the loopback addresses `127.0.0.1` (the new
+portal) and `127.0.0.2` (the old one), so redirects, the sign-in POST and the host proof go
+through urllib and a real socket. The self-test therefore opens loopback sockets, and nothing else.
+It needs no network and no credentials, but it does need a machine where `127.0.0.2` is loopback.
+That holds on Windows and on Linux, which are the two hosts it was run on. It is not run on macOS,
+which binds only `127.0.0.1` by default.
 
 ## Usage
 
@@ -108,7 +138,7 @@ python sharewatch.py watch --url https://county.maps.arcgis.com --username gis_a
 
 | Flag | Default | What it does |
 |---|---|---|
-| `mode` | none | `snapshot`, `diff` or `watch`. Required. |
+| `mode` | none | `snapshot`, `diff`, `watch` or `mirror`. Required. |
 | `--url` | none | Portal url, including `https://`. Required except for `diff`. |
 | `--query` | org id | Search query. Defaults to `orgid:` of the signed-in organization. |
 | `--token` | none | An existing portal token. |
@@ -117,7 +147,13 @@ python sharewatch.py watch --url https://county.maps.arcgis.com --username gis_a
 | `--dir` | none | Directory of snapshots, for `watch`. |
 | `--window-minutes` | `60` | Minutes within which one owner's changes collapse into one event. |
 | `--insecure` | off | Skip TLS verification, for an Enterprise portal behind an internal CA. |
-| `--apply` | off | Write the snapshot file. Without it nothing is written. |
+| `--old-url`, `--new-url` | none | `mirror`: the portal being left and the portal being checked. Both required. |
+| `--verify-host` | none | `mirror`: the bare host name the new portal must be on. Required. |
+| `--old-token`, `--new-token` | none | `mirror`: an existing token for each portal. |
+| `--old-username`, `--new-username` | none | `mirror`: generate a token on that portal. |
+| `--old-query`, `--new-query` | org id | `mirror`: the search query on each side. |
+| `--responses` | none | `mirror`: a JSON file of saved share-call responses to check for `notSharedWith`. |
+| `--apply` | off | Write the snapshot file. Without it nothing is written. Refused by `mirror`. |
 | `--self-test` | off | Run the offline assertions and exit. |
 
 There is no `--password` flag, and there never will be. `argv` is readable by every process on
@@ -133,7 +169,98 @@ standard error and into the scheduler log that captured it. The url is now refus
 request is built, and every credential in a request is redacted out of its error, not only the
 password.
 
-Exit codes: 0 nothing widened, 1 findings to review, 2 the portal call failed, 64 usage error.
+Exit codes: 0 nothing widened, 1 findings to review, 2 the portal call failed or the host proof
+failed, 64 usage error.
+
+## Mirror: did the new portal share what the old one did
+
+```
+export SHAREWATCH_OLD_PASSWORD='...'
+export SHAREWATCH_NEW_PASSWORD='...'
+python sharewatch.py mirror --old-url https://old.example.org --old-username gis_admin \
+    --new-url https://new.example.org --new-username gis_admin --verify-host new.example.org
+```
+
+The two portals are read the same way `snapshot` reads one, then compared. Item ids do not survive
+a copy, so items are paired by title and type, and groups by title with case ignored. Nothing is
+written, not even with `--apply`, which this mode refuses. The calls it makes are the same four
+REST calls as the other modes: `search`, `community/groups`, `portals/self` and `generateToken`.
+
+A real run against two stub portals holding synthetic data (one item missing, one group lost and
+two items made public):
+
+```
+old 127.0.0.2  ->  new 127.0.0.1 (verified host 127.0.0.1)
+--------------------------------------------------------------------
+4 paired, 1 only on the old portal, 0 only on the new, 0 not compared (ambiguous title)
+[ 95] mirror-public      2 item(s) by analyst: old org, new public
+        - Markers (Feature Service) b4
+        - Signs (Feature Service) b3
+[ 45] mirror-group-lost  1 item(s) by analyst: group 'Planning'
+        - Parcels (Feature Service) b2
+[ 45] mirror-missing     1 item(s) by analyst: shared org on the old portal, absent on the new one
+        - Trails (Feature Service) a5
+```
+
+| Severity | Kind | Meaning |
+|---|---|---|
+| 95 | `mirror-public` | Public on the new portal and not on the old one. |
+| 80 | `mirror-notshared` | A saved share response (`--responses`) was a 200 that did not share. |
+| 65 | `mirror-wider` | Wider on the new portal than on the old, short of public. |
+| 50 | `mirror-narrower` | Narrower on the new portal. Users lose access. |
+| 48 | `mirror-no-group` | The old item's group does not exist on the new portal, so no share into it can land. |
+| 45 | `mirror-missing` | An old item with no counterpart on the new portal. |
+| 45 | `mirror-group-lost` | In a group on the old portal and not on the new one. |
+| 35 | `mirror-group-extra` | In a group on the new portal and not on the old one. |
+| 30 | `mirror-new-public` | Public, and present only on the new portal. |
+| 30 | `mirror-ambiguous` | Two items share a title and type on a side. Not compared, and not guessed. |
+
+Wider on the new portal ranks above narrower, because a cutover that exposes a layer is worse than
+one that breaks a link. A private item that exists only on the new portal is counted and not
+reported.
+
+### The 200 that did not share
+
+The share operation answers with `itemId` and a `notSharedWith` array, "Array of groups with which
+the item could not be shared" ([share item as item owner][share]). The batch operation returns one
+object per item with `success`, `notSharedWith` and, on failure, an `error` object
+([share items][shareitems]). The status line is 200 whatever those say.
+
+Two ways to catch it. First, the live comparison above needs no saved responses: an item that was
+not shared into a group shows up as `mirror-group-lost`, and an item left less widely shared than
+its twin shows up as `mirror-narrower`. This also covers the call that carries no `notSharedWith` at all. The
+documentation says that to make an item private you "keep this parameter empty", so a share sent
+with an empty `groups` value and no `everyone` or `org` is a request to make the item private, and
+the response reports nothing wrong. Only a comparison sees it. Second, `--responses FILE` takes a
+JSON file of the answers your script saved, one object or a list, batch answers included, and
+reports each one that names groups in `notSharedWith`, holds an `error` object, or says
+`success: false`. The self-test runs both against the stub.
+
+[share]: https://developers.arcgis.com/rest/users-groups-and-items/share-item-as-item-owner/
+[shareitems]: https://developers.arcgis.com/rest/users-groups-and-items/share-items/
+
+### `--verify-host`: the check cannot read the old portal
+
+`--verify-host new.example.org` is the host name you believe the new portal is on, as a bare name
+with no scheme, port or path. The run is refused, with exit code 64 or 2 and before any search, if:
+
+1. `--new-url` is on another host (64).
+2. `--old-url` is on the verified host, because the run would compare the new portal with itself (64).
+3. The new portal's own `portals/self` answer declares another host (2). It reads `portalHostname`,
+   or `urlKey` and `customBaseUrl` joined with a dot. Esri documents these as "the portal host's
+   URL", "the prefix selected by the organization's administrator" and "the custom base URL for the
+   portal" ([portals/self][self]). A DNS alias that still reaches the old portal answers on the new
+   name and declares the old one. A portal that declares no host at all is refused too.
+4. The old portal's `portals/self` declares the verified host (2).
+
+After that, every request on each side is pinned to that side's own host. urllib follows a redirect
+to another host without a word, so a 302 from the new portal to the old one would have swapped the
+data under the new name. The pin refuses it, and the error carries no token.
+
+A token for one portal is never sent to the other. The two sign-ins use `SHAREWATCH_OLD_PASSWORD`
+and `SHAREWATCH_NEW_PASSWORD`, or an unechoed prompt, and never a flag.
+
+[self]: https://developers.arcgis.com/rest/users-groups-and-items/portal-self/
 
 ## What it records
 
@@ -150,20 +277,20 @@ groups that is 30 requests instead of 4,000.
 Findings are ranked, worst first, and bulk actions are collapsed.
 
 ```
-[100] item-public        9 item(s) by Asir.Khan_MarionCountyFL: org -> public
-        - Major Streets (Feature Service) 017177d5e47b46c5bbec757104945eec
-        - FHWA County Roads (Feature Service) 0215585d1a854e07aff697f167d3bf18
-        - Zoning Overlay (Feature Service) 03bf7a2c9d1e4a55b41d6f77c2d0e9a1
-        - Fire Hydrants (Feature Service) 0a6cf1b79c2d4e0d9f3b8a71e5c4d2f6
-        - Sidewalk Inventory (Feature Service) 0b1e4d7a8c934f22bb05d6e1f7a3c890
-        - Address Points with Occupants (Feature Service) 0c94a2e5f1b7480d9e22a6c3d5f81b47
-        - Bus Stops (Feature Service) 0d33b8c1e7a2495fae61d0942b5c7e38
-        - Stormwater Basins (Feature Service) 0e57f9a4b2c8416d83e147c6d90ab215
-        - Traffic Counts (Feature Service) 0f28c6d3a91b47e5b7204f8ac13d6e90
-[ 90] group-public       OCE Application Editors: group access org -> public (9 item(s) inside)
-[ 20] item-deleted       2 item(s) by Asir.Khan_MarionCountyFL: deleted or transferred out of the org
-        - Parcels 2019 Draft (Feature Service) del0
-        - Test Points (Feature Service) del1
+[100] item-public        9 item(s) by jsmith: org -> public
+        - Major Streets (Feature Service) 000000000000000000000000000a0000
+        - County Roads (Feature Service) 000000000000000000000000000a0001
+        - Zoning Overlay (Feature Service) 000000000000000000000000000a0002
+        - Fire Hydrants (Feature Service) 000000000000000000000000000a0003
+        - Sidewalk Inventory (Feature Service) 000000000000000000000000000a0004
+        - Address Points with Occupants (Feature Service) 000000000000000000000000000a0005
+        - Bus Stops (Feature Service) 000000000000000000000000000a0006
+        - Stormwater Basins (Feature Service) 000000000000000000000000000a0007
+        - Traffic Counts (Feature Service) 000000000000000000000000000a0008
+[ 90] group-public       Field Editors: group access org -> public (9 item(s) inside)
+[ 20] item-deleted       2 item(s) by jsmith: deleted or transferred out of the org
+        - Parcels 2019 Draft (Feature Service) 000000000000000000000000000d0000
+        - Test Points (Feature Service) 000000000000000000000000000d0001
 ```
 
 | Severity | Kind | Meaning |
@@ -189,7 +316,12 @@ item to a group does not update its modified date.
 
 It never changes sharing. There is no flag that does, the REST calls it makes are `search`,
 `community/groups`, `portals/self` and `generateToken`, and `--self-test` asserts that a
-plausible-looking `--unshare` is rejected rather than ignored.
+plausible-looking `--unshare` is rejected rather than ignored. It asserts the same for `mirror`
+against the socket stub: every request it made was one of the three read paths, and the only POST
+is the sign-in.
+
+Every parser has `allow_abbrev=False`, so no prefix of a flag is accepted. `--ap` is refused, and
+`--verify` is not read as `--verify-host`.
 
 A snapshot that reaches the 10,000 result ceiling says so instead of reporting a clean total.
 `search` counts accurately only to 10,000 and will not page past it, so above that the snapshot
@@ -200,6 +332,16 @@ reads as deletions. That is the false clean day running backwards: instead of hi
 deletions it invents thousands. The diff still runs, since the widenings in it are real.
 
 ## Why not the tools that already exist
+
+For the two-portal comparison I know of no tool that does it. A search of GitHub for `sharemirror`
+finds two repositories, and neither is related: one is a Windows utility that mirrors what is on
+screen, the other is a project of the same name from 2023 with no ArcGIS content. Searches for an
+ArcGIS sharing audit and for portal migration with groups and sharing returned nothing. That is what
+the search found, and it does not prove nothing exists. The `arcgis` Python API documents the same
+`notSharedWith` key in the return value of `Item.share`, which it has deprecated in favour of
+`Item.sharing`, so a script written with it can read the list. Reading it is the script's job, and
+the cutover script that did not is the case this mode exists for. This tool does not copy or share
+anything. It checks the result afterwards.
 
 An ArcGIS Online administrator can download an organization content report, a CSV with one row
 per item including its access. It is accurate, it is supported, and it is a photograph of right
@@ -267,6 +409,18 @@ too.
   have to be objects keyed by id, because the diff indexes them by id and a JSON list there
   used to reach the operator as a `TypeError` traceback.
 - Deleted groups are not reported. The items that were in them report as `item-left-group`.
+- Mirror pairs items by title and type, trimmed and case ignored. A title that two items share on
+  either side is reported as `mirror-ambiguous` and not compared. A renamed item reads as one
+  `mirror-missing` and one new item. Owners are not compared, because accounts differ after a move.
+- Mirror compares the sharing it can see with the token it was given. An item the account cannot
+  see is absent from the snapshot and reads as missing. Use an administrator token on each side.
+- `--verify-host` compares host names, not ports. Two portals on one host name and two ports are
+  not told apart. A reverse proxy that rewrites `portalHostname` would pass the declared-host test.
+- The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
+  The live comparison does.
+- A mirror read costs one request per group on each portal, the same as the other modes.
+- Coverage is 100 percent branch on Windows, measured with `coverage run --branch`. The Linux host
+  has no `coverage` module installed, so the Linux run reports the assertion count only.
 
 ## Contributing
 

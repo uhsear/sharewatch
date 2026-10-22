@@ -15,27 +15,41 @@ because that is one mistake, not nine.
 It is read-only. There is no flag that changes sharing, and the only thing it
 writes is a snapshot file, which needs --apply.
 
+The mirror mode compares two portals instead of two mornings. After a cutover a
+share call can answer HTTP 200 with notSharedWith and still not have shared, and
+an empty groups value shares with nothing and reports no error. Mirror reads
+what each portal holds now and reports where the new one differs, widest
+first. --verify-host names the host the new portal must be on, and the run is
+refused if the urls, the portal's own portals/self answer or a redirect say
+otherwise. Mirror writes nothing, not even with --apply.
+
     python sharewatch.py --self-test
     python sharewatch.py snapshot --url https://county.maps.arcgis.com --out snaps/ --apply
     python sharewatch.py diff snaps/sharewatch-20260914T060000Z.json snaps/sharewatch-20260915T060000Z.json
     python sharewatch.py watch --url https://county.maps.arcgis.com --dir snaps/ --apply
+    python sharewatch.py mirror --old-url https://old.example.org --new-url https://new.example.org --verify-host new.example.org
 
-Exit codes: 0 nothing widened, 1 findings to review, 2 the portal call failed,
-64 usage error.
+Exit codes: 0 nothing widened, 1 findings to review, 2 the portal call failed
+or a mirror host proof failed, 64 usage error.
 """
 
 from __future__ import print_function
 
 import argparse
+import contextlib
 import datetime
 import getpass
+import http.server
 import io
 import json
 import os
+import runpy
 import shutil
+import socketserver
 import ssl
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -71,6 +85,12 @@ REDACTED = "[redacted]"
 # history, in scheduler logs and in this tool's own error messages.
 SECRET_ENV = "SHAREWATCH_PASSWORD"
 
+# The same rule for the two sides of a mirror comparison. Two portals have two
+# accounts, so a single variable would sign one of them in with the other's
+# password.
+SECRET_ENV_OLD = "SHAREWATCH_OLD_PASSWORD"
+SECRET_ENV_NEW = "SHAREWATCH_NEW_PASSWORD"
+
 # =============================================================================
 # End of CONFIGURATION.
 # =============================================================================
@@ -93,6 +113,18 @@ SEVERITY = {
     "item-left-group": 15,
     "item-narrowed": 10,      # sharing was reduced. Recorded, not alarming.
     "group-narrowed": 10,
+    # mirror: the new portal compared with the old one. Wider than the old
+    # portal is the dangerous direction, narrower is only a broken link.
+    "mirror-public": 95,      # public on the new portal, not public on the old
+    "mirror-notshared": 80,   # a share call came back 200 and did not share
+    "mirror-wider": 65,       # wider than the old portal, short of public
+    "mirror-narrower": 50,    # narrower than the old portal: users lose access
+    "mirror-no-group": 48,    # the old item's group does not exist on the new portal
+    "mirror-missing": 45,     # an old item with no counterpart on the new portal
+    "mirror-group-lost": 45,  # in a group on the old portal, not on the new one
+    "mirror-group-extra": 35,  # in a group on the new portal, not on the old one
+    "mirror-new-public": 30,  # public on the new portal and not on the old at all
+    "mirror-ambiguous": 30,   # two items share a title and type, so no pairing
 }
 
 # Kinds whose timestamp is not evidence of when the change happened, so they are
@@ -100,8 +132,14 @@ SEVERITY = {
 # date behind, only the modified date it had while it existed, and adding an item
 # to a group does not bump modified at all. Bucketing either one by time splits
 # a single bulk action into one event per item: 60 items deleted in one go were
-# reported as 60 events, dated by edits years apart.
-UNTIMED_KINDS = frozenset(["item-deleted", "item-joined-group", "item-left-group"])
+# reported as 60 events, dated by edits years apart. Every mirror kind is
+# untimed too: two portals are compared as they are now, and the modified date
+# of an item says nothing about when somebody forgot to share it.
+UNTIMED_KINDS = frozenset(["item-deleted", "item-joined-group", "item-left-group",
+                           "mirror-public", "mirror-notshared", "mirror-wider",
+                           "mirror-narrower", "mirror-no-group", "mirror-missing",
+                           "mirror-group-lost", "mirror-group-extra",
+                           "mirror-new-public", "mirror-ambiguous"])
 
 SNAPSHOT_PREFIX = "sharewatch-"
 SNAPSHOT_SUFFIX = ".json"
@@ -189,7 +227,7 @@ def printable(text, encoding):
     return text
 
 
-def truncation_warning(old, new):
+def truncation_warning(old, new, labels=("older", "newer")):
     """Lines warning that a snapshot in this diff is incomplete.
 
     A truncated snapshot holds an unknown subset of the org, so every item the
@@ -198,7 +236,7 @@ def truncation_warning(old, new):
     thousands. The diff still runs, because the widenings in it are real.
     """
     lines = []
-    for label, snapshot in (("older", old), ("newer", new)):
+    for label, snapshot in zip(labels, (old, new)):
         if snapshot.get("truncated"):
             lines.append("WARNING: the %s snapshot reached the %d result "
                          "ceiling." % (label, SEARCH_CEILING))
@@ -500,18 +538,25 @@ def diff_snapshots(old, new, window_minutes=DEFAULT_WINDOW_MINUTES):
                 item_count=items_in_group(new, gid),
             ))
 
-    # Worst first, then the biggest blast radius, so the top line is the line to
-    # act on. The owner and kind tail-break only to keep the order stable.
+    return rank_events(events)
+
+
+def rank_events(events):
+    """Sort events worst first, then by the biggest blast radius.
+
+    The top line is the line to act on. The owner and kind tail-break only to
+    keep the order stable.
+    """
     events.sort(key=lambda e: (-e.severity,
                                -(e.item_count or len(e.items)),
                                e.owner, e.kind))
     return events
 
 
-def describe(events):
+def describe(events, quiet="No sharing changes between the two snapshots."):
     """Render events as the lines the CLI prints."""
     if not events:
-        return ["No sharing changes between the two snapshots."]
+        return [quiet]
     out = []
     for ev in events:
         if ev.item_count is not None:
@@ -530,24 +575,229 @@ def describe(events):
     return out
 
 
+# ------------------------------------------------------------ mirror: the core
+
+def host_of(url):
+    """The lower-case host name of a url, without port, or "" when it has none."""
+    return urllib.parse.urlparse(url or "").hostname or ""
+
+
+def check_hosts(old_url, new_url, verify_host):
+    """Refuse a mirror run that could read the old portal as the new one.
+
+    --verify-host names the host the operator believes the NEW portal is on.
+    The comparison is only worth anything if the new side really is that host,
+    and the old side really is another: a cutover script that was pointed at
+    the old portal twice reports a perfect mirror. Returns the host, normalised.
+    """
+    host = (verify_host or "").strip().lower()
+    if not host or "/" in host or ":" in host:
+        raise ValueError("--verify-host takes a bare host name such as "
+                         "gis.example.org, got %r" % (verify_host,))
+    if host_of(new_url) != host:
+        raise ValueError("--new-url is on host %r, not the verified host %r"
+                         % (host_of(new_url), host))
+    if host_of(old_url) == host:
+        raise ValueError("--old-url is on the verified host %r too, so this "
+                         "run would compare the new portal with itself" % host)
+    return host
+
+
+def declared_hosts(body):
+    """The host names a portal says it has, from its own portals/self answer.
+
+    The url that answered is only what the operator typed. The portal's
+    portalHostname, or urlKey plus customBaseUrl on an organization, is what it
+    says it is. A DNS alias or a reverse proxy left pointing at the old portal
+    answers on the new host name and declares the old one.
+    """
+    hosts = set()
+    name = body.get("portalHostname")
+    if name:
+        hosts.add(str(name).split("://")[-1].split("/")[0].split(":")[0].lower())
+    if body.get("urlKey") and body.get("customBaseUrl"):
+        hosts.add(("%s.%s" % (body["urlKey"], body["customBaseUrl"])).lower())
+    return hosts
+
+
+class _PinnedRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect that leaves the host this opener was pinned to.
+
+    A 302 from the new portal to the old one would be followed silently, and
+    every later answer would be the old portal's under the new portal's name.
+    """
+
+    def __init__(self, host):
+        self.host = host
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if host_of(newurl) != self.host:
+            raise urllib.error.URLError(
+                "redirect to %s leaves the verified host %s"
+                % (newurl, self.host))
+        return urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+
+
+def _norm(text):
+    """Title text as compared across portals: trimmed, case ignored."""
+    return ("%s" % (text or "")).strip().lower()
+
+
+def _item_groups(snapshot, item):
+    """{normalised title: title} of the groups an item is in, in this snapshot."""
+    groups = snapshot.get("groups", {})
+    out = {}
+    for gid in item.get("groups") or []:
+        title = (groups.get(gid) or {}).get("title") or gid
+        out[_norm(title)] = title
+    return out
+
+
+def _by_key(snapshot):
+    """Items grouped by (title, type), the only key two portals share.
+
+    Item ids do not survive a copy to another portal, so the id cannot pair
+    them. Two items with one title and type on a side are kept together, and
+    the caller refuses to guess which is which.
+    """
+    keyed = {}
+    for iid in sorted(snapshot.get("items", {})):
+        item = snapshot["items"][iid]
+        keyed.setdefault((_norm(item.get("title")), item.get("type") or ""),
+                         []).append(item)
+    return keyed
+
+
+def mirror_diff(old, new, window_minutes=DEFAULT_WINDOW_MINUTES):
+    """Compare the sharing of the old portal with the new one.
+
+    Returns (events, stats), events worst first. Items are paired by title and
+    type. Wider on the new portal is reported before narrower, because a cutover
+    that exposes something is worse than one that breaks a link. Nothing is
+    guessed: a title that two items share on either side is reported, not paired.
+    """
+    old_keyed, new_keyed = _by_key(old), _by_key(new)
+    new_titles = set(_norm(g.get("title") or gid)
+                     for gid, g in new.get("groups", {}).items())
+    stats = {"paired": 0, "old_only": 0, "new_only": 0, "ambiguous": 0}
+    findings = []
+    for key in sorted(set(old_keyed) | set(new_keyed)):
+        olds, news = old_keyed.get(key, []), new_keyed.get(key, [])
+        if not olds:
+            stats["new_only"] += len(news)
+            for it in news:
+                if it.get("access") == "public":
+                    findings.append(_finding(
+                        "mirror-new-public", it,
+                        "public on the new portal, not on the old one at all"))
+            continue
+        if not news:
+            stats["old_only"] += len(olds)
+            for it in olds:
+                findings.append(_finding(
+                    "mirror-missing", it,
+                    "shared %s on the old portal, absent on the new one"
+                    % it.get("access")))
+            continue
+        if len(olds) > 1 or len(news) > 1:
+            stats["ambiguous"] += len(news)
+            for it in news:
+                findings.append(_finding(
+                    "mirror-ambiguous", it,
+                    "%d old and %d new items share this title and type, so "
+                    "none was compared" % (len(olds), len(news))))
+            continue
+        stats["paired"] += 1
+        was, now = olds[0], news[0]
+        old_access = was.get("access", "private")
+        new_access = now.get("access", "private")
+        if access_rank(new_access) > access_rank(old_access):
+            kind = "mirror-public" if new_access == "public" else "mirror-wider"
+            findings.append(_finding(kind, now, "old %s, new %s"
+                                     % (old_access, new_access)))
+        elif access_rank(new_access) < access_rank(old_access):
+            findings.append(_finding("mirror-narrower", now, "old %s, new %s"
+                                    % (old_access, new_access)))
+        had, has = _item_groups(old, was), _item_groups(new, now)
+        for norm in sorted(set(had) - set(has)):
+            kind = ("mirror-group-lost" if norm in new_titles
+                    else "mirror-no-group")
+            findings.append(_finding(kind, now, "group '%s'" % had[norm]))
+        for norm in sorted(set(has) - set(had)):
+            findings.append(_finding("mirror-group-extra", now,
+                                     "group '%s'" % has[norm]))
+    return rank_events(collapse(findings, window_minutes)), stats
+
+
+def share_response_findings(bodies, new):
+    """Findings for share calls that came back 200 and did not share.
+
+    A share call answers HTTP 200 whatever happened. The groups it could not
+    share with are listed in notSharedWith, and a script that checks only the
+    status counts the item done. A batch answer carries one such object per
+    item under "results". An empty groups value shares with no group at all and
+    reports nothing wrong, so it is invisible here and only mirror_diff sees it.
+    """
+    results = []
+    for body in bodies:
+        if not isinstance(body, dict):
+            raise ValueError("a share response has to be a JSON object, got %s"
+                             % type(body).__name__)
+        if isinstance(body.get("results"), list):
+            results.extend(body["results"])
+        else:
+            results.append(body)
+    findings = []
+    for res in results:
+        if not isinstance(res, dict):
+            raise ValueError("a share response has to be a JSON object, got %s"
+                             % type(res).__name__)
+        iid = res.get("itemId") or ""
+        item = new.get("items", {}).get(iid) or {
+            "id": iid, "title": "(not in the new snapshot)", "owner": "",
+            "type": "", "modified": 0}
+        if isinstance(res.get("error"), dict):
+            err = res["error"]
+            detail = "share call failed: %s %s" % (err.get("code"),
+                                                   err.get("message"))
+        elif res.get("notSharedWith"):
+            skipped = res["notSharedWith"]
+            if not isinstance(skipped, list):
+                skipped = [skipped]
+            detail = "share call returned 200 but not shared with %s" % (
+                ", ".join(sorted("%s" % g for g in skipped)))
+        elif res.get("success") is False:
+            detail = "share call reported success false"
+        else:
+            continue
+        findings.append(_finding("mirror-notshared", item, detail))
+    return collapse(findings)
+
+
 # ---------------------------------------------------------------- portal i/o
 
-def _opener(insecure):
+def _opener(insecure, pin_host=None):
     """Build a urllib opener, optionally without certificate verification.
 
     Enterprise portals behind an internal CA are the reason --insecure exists.
     It is off by default and refused together with a password, because posting
     credentials down an unverified connection is the failure it would cause.
+    With pin_host the opener also refuses to follow a redirect to another host.
     """
-    if not insecure:
-        return urllib.request.build_opener()
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+    handlers = []
+    if pin_host:
+        handlers.append(_PinnedRedirect(pin_host))
+    if insecure:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers)
 
 
-def _call(url, path, params, insecure=False, post=False, secret=None):
+def _call(url, path, params, insecure=False, post=False, secret=None,
+          pin_host=None):
     """One REST call returning parsed JSON, with the portal's own errors raised.
 
     The portal answers HTTP 200 with an error object in the body, so the status
@@ -557,7 +807,7 @@ def _call(url, path, params, insecure=False, post=False, secret=None):
     params["f"] = "json"
     endpoint = "%s/sharing/rest/%s" % (url.rstrip("/"), path.lstrip("/"))
     data = urllib.parse.urlencode(params).encode("utf-8")
-    opener = _opener(insecure)
+    opener = _opener(insecure, pin_host)
     try:
         if post:
             response = opener.open(endpoint, data, timeout=HTTP_TIMEOUT)
@@ -580,19 +830,19 @@ def _call(url, path, params, insecure=False, post=False, secret=None):
     return body
 
 
-def read_secret(username):
+def read_secret(username, env=SECRET_ENV):
     """Get the password from the environment, or prompt for it.
 
     Never from argv. getpass keeps it off the screen, and it is passed on to
     redact() so that nothing downstream can print it back out.
     """
-    secret = os.environ.get(SECRET_ENV)
+    secret = os.environ.get(env)
     if secret:
         return secret
     return getpass.getpass("password for %s (not echoed): " % username)
 
 
-def generate_token(url, username, secret, insecure=False):
+def generate_token(url, username, secret, insecure=False, pin_host=None):
     """Exchange a username and password for a short-lived token."""
     body = _call(url, "generateToken", {
         "username": username,
@@ -600,20 +850,25 @@ def generate_token(url, username, secret, insecure=False):
         "client": "referer",
         "referer": url,
         "expiration": 60,
-    }, insecure=insecure, post=True, secret=secret)
+    }, insecure=insecure, post=True, secret=secret, pin_host=pin_host)
     token = body.get("token")
     if not token:
         raise RuntimeError("generateToken returned no token")
     return token
 
 
-def org_id(url, token, insecure=False):
+def portal_self(url, token, insecure=False, pin_host=None):
+    """The portal's own description of itself: its org id and its host names."""
     params = {"token": token} if token else {}
-    body = _call(url, "portals/self", params, insecure=insecure)
-    return body.get("id")
+    return _call(url, "portals/self", params, insecure=insecure,
+                 pin_host=pin_host)
 
 
-def search_items(url, query, token, insecure=False, echo=None):
+def org_id(url, token, insecure=False):
+    return portal_self(url, token, insecure).get("id")
+
+
+def search_items(url, query, token, insecure=False, echo=None, pin_host=None):
     """Page /sharing/rest/search and return (items, reported total, truncated).
 
     num is clamped before it is sent, because the server clamps it silently and
@@ -628,7 +883,8 @@ def search_items(url, query, token, insecure=False, echo=None):
                   "sortField": "modified", "sortOrder": "desc"}
         if token:
             params["token"] = token
-        body = _call(url, "search", params, insecure=insecure)
+        body = _call(url, "search", params, insecure=insecure,
+                     pin_host=pin_host)
         total = int(body.get("total") or 0)
         results = body.get("results") or []
         for raw in results:
@@ -639,7 +895,7 @@ def search_items(url, query, token, insecure=False, echo=None):
     return items, total, is_truncated(total)
 
 
-def search_groups(url, query, token, insecure=False):
+def search_groups(url, query, token, insecure=False, pin_host=None):
     """Page /sharing/rest/community/groups the same way search is paged."""
     groups = {}
     start = 1
@@ -647,7 +903,8 @@ def search_groups(url, query, token, insecure=False):
         params = {"q": query, "start": start, "num": clamp_num(SEARCH_MAX_NUM)}
         if token:
             params["token"] = token
-        body = _call(url, "community/groups", params, insecure=insecure)
+        body = _call(url, "community/groups", params, insecure=insecure,
+                     pin_host=pin_host)
         total = int(body.get("total") or 0)
         results = body.get("results") or []
         for raw in results:
@@ -656,7 +913,8 @@ def search_groups(url, query, token, insecure=False):
     return groups
 
 
-def attach_groups(url, items, groups, token, insecure=False, echo=None):
+def attach_groups(url, items, groups, token, insecure=False, echo=None,
+                  pin_host=None):
     """Record which groups each item is shared to.
 
     Done by searching each group's contents rather than by asking each item for
@@ -665,7 +923,7 @@ def attach_groups(url, items, groups, token, insecure=False, echo=None):
     """
     for gid in sorted(groups):
         members, _total, _trunc = search_items(
-            url, "group:%s" % gid, token, insecure=insecure)
+            url, "group:%s" % gid, token, insecure=insecure, pin_host=pin_host)
         for iid in members:
             if iid in items:
                 items[iid]["groups"].append(gid)
@@ -676,12 +934,14 @@ def attach_groups(url, items, groups, token, insecure=False, echo=None):
     return items
 
 
-def take_snapshot(url, query, token, insecure=False, echo=None):
+def take_snapshot(url, query, token, insecure=False, echo=None, pin_host=None):
     """Read the whole sharing posture of one org into a snapshot document."""
-    items, total, truncated = search_items(url, query, token,
-                                           insecure=insecure, echo=echo)
-    groups = search_groups(url, query, token, insecure=insecure)
-    attach_groups(url, items, groups, token, insecure=insecure, echo=echo)
+    items, total, truncated = search_items(url, query, token, insecure=insecure,
+                                           echo=echo, pin_host=pin_host)
+    groups = search_groups(url, query, token, insecure=insecure,
+                           pin_host=pin_host)
+    attach_groups(url, items, groups, token, insecure=insecure, echo=echo,
+                  pin_host=pin_host)
     taken = utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     return build_snapshot(url, taken, items, groups, total, truncated)
 
@@ -1223,8 +1483,9 @@ def self_test():
 
         def __init__(self, items=(), groups=(), org="ORG123", token="TESTTOKEN",
                      reported_total=None, fail_search_after=None,
-                     open_error=None, cap=100):
+                     open_error=None, cap=100, self_fields=None):
             self.items = list(items)
+            self.self_fields = dict(self_fields or {})   # host names, urlKey
             self.groups = list(groups)
             self.org = org
             self.token = token
@@ -1236,9 +1497,11 @@ def self_test():
             self.targets = []
             self.posted = []
             self.insecure = None
+            self.pinned = []
 
-        def __call__(self, insecure):         # stands in for _opener(insecure)
+        def __call__(self, insecure, pin_host=None):   # stands in for _opener
             self.insecure = insecure
+            self.pinned.append(pin_host)
             return self
 
         def open(self, target, data=None, timeout=None):
@@ -1260,7 +1523,9 @@ def self_test():
                                       "message": "Invalid username or password."}}
                 return {"token": self.token, "expires": 9999999999999}
             if path.endswith("/portals/self"):
-                return {"id": self.org} if self.org else {}
+                described = {"id": self.org} if self.org else {}
+                described.update(self.self_fields)
+                return described
             if path.endswith("/community/groups"):
                 return self._page(self.groups, params)
             if path.endswith("/search"):
@@ -1829,6 +2094,577 @@ def self_test():
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
+    # ---- mirror: two portals compared, read-only, with the host proven
+    #
+    # The fixtures are one cutover in miniature. Item ids do not survive a copy,
+    # so the old and the new portal hold the same titles under different ids.
+    def twin(prefix, specs):
+        return dict((prefix + key, item(prefix + key, owner, access, when,
+                                        groups=[prefix + g for g in grp],
+                                        title=title))
+                    for key, title, owner, access, when, grp in specs)
+
+    def mirror_groups(prefix, specs):
+        return dict((prefix + key, group(prefix + key, "org", title=title))
+                    for key, title in specs)
+
+    far = 10000 * minute
+    old_mirror_items = twin("o-", [
+        ("roads", "Roads", "jsmith", "public", day1, ["g1"]),
+        ("parcels", "Parcels", "jsmith", "org", day1, ["g1", "g2"]),
+        ("hyd", "Hydrants", "kpatel", "org", day1, []),
+        ("zone", "Zoning", "kpatel", "public", day1, ["g3"]),
+        ("trail", "Trails", "kpatel", "org", day1, []),
+        ("basin", "Basins", "mreyes", "public", day1, []),
+        ("dup1", "Dup", "mreyes", "org", day1, []),
+        ("dup2", "Dup", "mreyes", "org", day1, []),
+        ("sign", "Signs", "twilson", "org", day1, []),
+        ("mark", "Markers", "twilson", "org", day1, []),
+        ("culv", "Culverts", "mreyes", "private", day1, [])])
+    new_mirror_items = twin("n-", [
+        ("roads", "Roads", "jsmith", "public", day1, ["g1"]),
+        ("parcels", "Parcels", "jsmith", "org", day1, ["g1"]),
+        ("hyd", "Hydrants", "kpatel", "org", day1, ["g2"]),
+        ("zone", "Zoning", "kpatel", "public", day1, []),
+        ("basin", "Basins", "mreyes", "org", day1, []),
+        ("dup", "Dup", "mreyes", "org", day1, []),
+        ("sign", "Signs", "twilson", "public", day1, []),
+        ("mark", "Markers", "twilson", "public", day1 + far, []),
+        ("culv", "Culverts", "mreyes", "org", day1, []),
+        ("fresh", "Brand New", "gis_admin", "public", day1, []),
+        ("quiet", "Quiet", "gis_admin", "private", day1, [])])
+    OLD_MIRROR = build_snapshot(
+        "https://old.example.org", "2026-09-15T06:00:00Z", old_mirror_items,
+        mirror_groups("o-", [("g1", "Public Works"), ("g2", "Planning"),
+                             ("g3", "Retired Group")]), 11, False)
+    NEW_MIRROR = build_snapshot(
+        "https://new.example.org", "2026-09-15T06:00:00Z", new_mirror_items,
+        mirror_groups("n-", [("g1", "public works"), ("g2", "Planning")]),
+        11, False)
+
+    # ---- the host proof, in the pure core
+    check(host_of("https://GIS.Example.org:7443/portal") == "gis.example.org",
+          "the host is read without its port, its path or its case")
+    check(host_of("") == "" and host_of(None) == "",
+          "a missing url has no host, not an exception")
+    check(check_hosts("https://old.example.org", "https://new.example.org",
+                      " NEW.example.org ") == "new.example.org",
+          "a verify host is trimmed and lower-cased")
+    for bad, why in (("", "an empty"), ("https://new.example.org", "a url as"),
+                     ("new.example.org:7443", "a host with a port as")):
+        raises(lambda: check_hosts("https://old.example.org",
+                                   "https://new.example.org", bad),
+               "%s --verify-host is refused, it takes a bare host name" % why)
+    raises(lambda: check_hosts("https://old.example.org",
+                               "https://elsewhere.example.org",
+                               "new.example.org"),
+           "a --new-url on another host than --verify-host is refused  "
+           "<-- pinned defect")
+    raises(lambda: check_hosts("https://new.example.org:8443",
+                               "https://new.example.org", "new.example.org"),
+           "an --old-url on the verified host is refused, or the run compares "
+           "the new portal with itself  <-- pinned defect")
+    check(declared_hosts({"portalHostname": "gis.example.org:7443/arcgis"})
+          == {"gis.example.org"},
+          "an Enterprise portalHostname loses its port and its web adaptor")
+    check(declared_hosts({"portalHostname": "https://GIS.example.org"})
+          == {"gis.example.org"}, "a portalHostname that carries a scheme is read")
+    check(declared_hosts({"urlKey": "Acme", "customBaseUrl": "maps.example.org"})
+          == {"acme.maps.example.org"},
+          "an organization declares itself as urlKey dot customBaseUrl")
+    check(declared_hosts({"urlKey": "acme"}) == set()
+          and declared_hosts({}) == set(),
+          "a portal that declares no host declares an empty set")
+
+    # ---- the comparison, in the pure core
+    mirrored, mstats = mirror_diff(OLD_MIRROR, NEW_MIRROR)
+    mkinds = dict((ev.kind, ev) for ev in mirrored)
+    check(sorted(mkinds) == ["mirror-ambiguous", "mirror-group-extra",
+                             "mirror-group-lost", "mirror-missing",
+                             "mirror-narrower", "mirror-new-public",
+                             "mirror-no-group", "mirror-public", "mirror-wider"],
+          "every difference between the two portals is one of nine kinds")
+    check(mstats == {"paired": 8, "old_only": 1, "new_only": 2, "ambiguous": 1},
+          "the run counts what it paired, what it could not and what it skipped")
+    check([ev.kind for ev in mirrored[:3]]
+          == ["mirror-public", "mirror-wider", "mirror-narrower"],
+          "wider on the new portal outranks narrower, public first")
+    check(len(mkinds["mirror-public"].items) == 2,
+          "two items made public by one owner are one event even when their "
+          "dates are a week apart  <-- pinned defect")
+    check(mkinds["mirror-public"].detail == "old org, new public",
+          "the event says what the old portal had and what the new one has")
+    check(mkinds["mirror-no-group"].detail == "group 'Retired Group'",
+          "a group that does not exist on the new portal is named, because a "
+          "share into it can never land")
+    check(mkinds["mirror-group-lost"].detail == "group 'Planning'",
+          "a group the item left behind is named")
+    check(mkinds["mirror-group-extra"].detail == "group 'Planning'",
+          "a group the item gained on the new portal is named")
+    check(not any("ublic" in ev.detail and "orks" in ev.detail
+                  for ev in mirrored),
+          "a group title that differs only in case is the same group")
+    check(mkinds["mirror-missing"].items[0]["title"] == "Trails",
+          "an item the old portal has and the new one lacks is named")
+    check([i["title"] for i in mkinds["mirror-ambiguous"].items] == ["Dup"],
+          "two items with one title and type are reported, not paired by guess")
+    check(mkinds["mirror-new-public"].items[0]["title"] == "Brand New",
+          "a public item that exists only on the new portal is reported")
+    check(not any(i["title"] == "Quiet" for ev in mirrored for i in ev.items),
+          "a private item that exists only on the new portal is only counted")
+    same, sstats = mirror_diff(OLD_MIRROR, OLD_MIRROR)
+    check([ev.kind for ev in same] == ["mirror-ambiguous"]
+          and sstats["paired"] == 9,
+          "a portal compared with itself differs only by the title it cannot "
+          "pair")
+    check(describe([], "none") == ["none"], "a quiet comparison has its own words")
+    raises(lambda: mirror_diff(
+        OLD_MIRROR, build_snapshot("u", "t", {"x": item(
+            "x", "o", "everyone", day1, title="Roads")}, {}, 1, False)),
+        "a sharing level this version does not know is refused in a mirror too")
+
+    # ---- the 200 that did not share
+    saved_replies = [
+        {"itemId": "n-roads", "notSharedWith": ["n-g9", "n-g1"]},
+        {"itemId": "n-parcels", "notSharedWith": []},
+        {"results": [{"itemId": "n-hyd", "success": True, "notSharedWith": []},
+                     {"itemId": "n-zone", "success": False},
+                     {"itemId": "x-gone", "error": {"code": 403,
+                                                    "message": "No access"}}]},
+        {"itemId": "n-sign", "notSharedWith": "n-g8"}]
+    unshared = share_response_findings(saved_replies, NEW_MIRROR)
+    check(len(unshared) == 4 and all(ev.kind == "mirror-notshared"
+                                     for ev in unshared),
+          "a 200 that names groups in notSharedWith is a finding, not a "
+          "success  <-- pinned defect")
+    check(any("n-g1, n-g9" in ev.detail for ev in unshared),
+          "the groups it could not share with are named")
+    check(any(ev.detail.endswith("n-g8") for ev in unshared),
+          "a notSharedWith that is a bare string is read as one group")
+    check(not any(i["id"] == "n-parcels" for ev in unshared for i in ev.items),
+          "an empty notSharedWith is not a finding")
+    check(any(ev.items[0]["title"] == "Roads" for ev in unshared),
+          "the finding names the item from the new snapshot")
+    check(any("No access" in ev.detail and ev.items[0]["id"] == "x-gone"
+              for ev in unshared),
+          "an error object inside a batch answer is a finding, and an item the "
+          "snapshot never saw is still named by id")
+    check(any("success false" in ev.detail for ev in unshared),
+          "success false with no error object is a finding too")
+    check(share_response_findings([], NEW_MIRROR) == [],
+          "no saved responses, no findings")
+    raises(lambda: share_response_findings([3], NEW_MIRROR),
+           "a saved response that is not an object is refused")
+    raises(lambda: share_response_findings([{"results": [3]}], NEW_MIRROR),
+           "a batch answer holding a non-object is refused")
+
+    # ---- the mirror parser
+    m = _parse(["mirror", "--old-url", "a", "--new-url", "b", "--verify-host", "h",
+                "--old-token", "OT", "--new-token", "NT", "--old-username", "ou",
+                "--new-username", "nu", "--old-query", "oq", "--new-query", "nq",
+                "--responses", "r.json"])
+    check((m.old_url, m.new_url, m.verify_host) == ("a", "b", "h"),
+          "--old-url, --new-url and --verify-host are read")
+    check((m.old_token, m.new_token, m.old_username, m.new_username)
+          == ("OT", "NT", "ou", "nu"), "a credential is read per portal")
+    check((m.old_query, m.new_query, m.responses) == ("oq", "nq", "r.json"),
+          "--old-query, --new-query and --responses are read")
+    refuses(["mirror", "--verify", "h"],
+            "a prefix of --verify-host is refused  <-- pinned defect")
+    refuses(["mirror", "--ap"],
+            "a prefix of --apply is refused on the mirror mode too  "
+            "<-- pinned defect")
+    refuses(["mirror", "--old", "x"], "a prefix of --old-url is refused")
+
+    # ---- the pin reaches every request of a read
+    pinned_portal = FakePortal(catalog[:5], portal_groups)
+    serving(pinned_portal, lambda: take_snapshot(
+        PORTAL, "orgid:ORG123", "TESTTOKEN", pin_host="county.maps.arcgis.com"))
+    check(len(pinned_portal.pinned) == 3
+          and set(pinned_portal.pinned) == {"county.maps.arcgis.com"},
+          "the pinned host reaches every search, group and member request")
+
+    # ---- the same, over a real socket
+    #
+    # http.server on the loopback address answers with the in-process portal's
+    # own bodies, so the redirect and the POST body are exercised by urllib
+    # itself, not by a stand-in. The old portal is 127.0.0.2 and the new one
+    # 127.0.0.1: one machine, two host names.
+    class StubHandler(http.server.BaseHTTPRequestHandler):
+        bounce_to = ""          # where /bounce sends the caller: another host
+
+        def _answer(self, query):
+            path = self.path.partition("?")[0]
+            port = self.server.server_address[1]
+            self.server.portal.targets.append(self.path)
+            for tail, origin in (("/bounce", StubHandler.bounce_to),
+                                 ("/stay", "http://127.0.0.1:%d" % port)):
+                if path.endswith(tail):
+                    self.send_response(302)
+                    self.send_header("Location", "%s/sharing/rest/portals/self"
+                                     "?%s" % (origin, query))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+            body = json.dumps(self.server.portal._body(path, dict(
+                urllib.parse.parse_qsl(query)))).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._answer(self.path.partition("?")[2])
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length") or 0)
+            text = self.rfile.read(size).decode("utf-8")
+            self.server.portal.posted.append(text)
+            self._answer(text)
+
+        def log_message(self, *ignored):
+            pass
+
+    class StubServer(http.server.HTTPServer):
+        def server_bind(self):
+            # HTTPServer asks DNS for its own name here, which takes seconds on
+            # a Windows machine with no resolver and is of no use to a stub.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
+    @contextlib.contextmanager
+    def listening(*portals, **kw):
+        """Serve each portal on its own loopback address. Yields the ports.
+
+        127.0.0.2 is a second host name for the same machine, and avoids
+        "localhost", which Windows tries as ::1 first and takes seconds to give
+        up on for every request.
+        """
+        servers = []
+        hosts = kw.get("hosts") or ["127.0.0.1"] * len(portals)
+        try:
+            for a_portal, address in zip(portals, hosts):
+                server = StubServer((address, 0), StubHandler)
+                server.portal = a_portal
+                threading.Thread(target=server.serve_forever,
+                                 kwargs={"poll_interval": 0.02}).start()
+                servers.append(server)
+            yield [srv.server_address[1] for srv in servers]
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+
+    @contextlib.contextmanager
+    def env_set(name, value):
+        had, prior = name in os.environ, os.environ.get(name)
+        os.environ[name] = value
+        try:
+            yield
+        finally:
+            if had:
+                os.environ[name] = prior
+            else:
+                del os.environ[name]
+
+    def rows_of(items_by_id):
+        return [dict(it, _groups=list(it["groups"]))
+                for it in items_by_id.values()]
+
+    def mirror_pair(**new_args):
+        """An old portal and a new one, holding the two fixture snapshots."""
+        old_p = FakePortal(rows_of(old_mirror_items),
+                           list(OLD_MIRROR["groups"].values()), org="OLDORG")
+        new_kw = dict(org="NEWORG")
+        new_kw.update(new_args)
+        new_p = FakePortal(rows_of(new_mirror_items),
+                           list(NEW_MIRROR["groups"].values()), **new_kw)
+        return old_p, new_p
+
+    def run_mirror(old_p, new_p, extra=(), verify="127.0.0.1",
+                   encoding="utf-8"):
+        with listening(old_p, new_p, hosts=["127.0.0.2", "127.0.0.1"]) as (
+                po, pn):
+            old_p.self_fields.setdefault("portalHostname", "127.0.0.2:%d" % po)
+            new_p.self_fields.setdefault("portalHostname",
+                                         "127.0.0.1:%d/arcgis" % pn)
+            argv = ["mirror", "--old-url", "http://127.0.0.2:%d" % po,
+                    "--new-url", "http://127.0.0.1:%d" % pn,
+                    "--verify-host", verify] + list(extra)
+            return captured(lambda: main(argv), encoding)
+
+    # the redirect, which would swap one portal for the other halfway
+    probe_portal = FakePortal(org="PROBE")
+    with listening(probe_portal, probe_portal,
+                   hosts=["127.0.0.1", "127.0.0.2"]) as (pp, pq):
+        StubHandler.bounce_to = "http://127.0.0.2:%d" % pq
+        base = "http://127.0.0.1:%d" % pp
+        followed = _call(base, "bounce", {"token": "SECRETTOKEN"})
+        check(followed.get("id") == "PROBE",
+              "an unpinned call follows a redirect to another host without a "
+              "word, which is the failure the pin exists for")
+        bounced = fails(lambda: _call(base, "bounce", {"token": "SECRETTOKEN"},
+                                      pin_host="127.0.0.1"),
+                        "a pinned call refuses a redirect to another host  "
+                        "<-- pinned defect")
+        check("leaves the verified host" in bounced
+              and "SECRETTOKEN" not in bounced,
+              "the refusal names the problem and carries no token")
+        check(_call(base, "stay", {}, pin_host="127.0.0.1").get("id") == "PROBE",
+              "a pinned call still follows a redirect that stays on its host")
+    check(any(isinstance(h, _PinnedRedirect) and h.host == "h"
+              for h in _opener(False, "h").handlers),
+          "an opener built with a pin carries the redirect guard")
+    check(not any(isinstance(h, _PinnedRedirect)
+                  for h in _opener(False).handlers),
+          "an opener built without a pin is unchanged")
+
+    old_p, new_p = mirror_pair()
+    code, seen = run_mirror(old_p, new_p, ["--old-token", "OLDT",
+                                           "--new-token", "NEWT"])
+    check(code == 1, "a mirror run that found differences exits 1")
+    check("old portal on host 127.0.0.2" in seen
+          and "new portal on host 127.0.0.1" in seen,
+          "the run says which host each side was read from")
+    check("verified host 127.0.0.1" in seen,
+          "the header names the verified host")
+    check("8 paired, 1 only on the old portal, 2 only on the new, 1 not "
+          "compared" in seen, "the run says how much it compared")
+    check("mirror-public" in seen and "2 item(s) by twilson" in seen,
+          "the report leads with what became public")
+    check(seen.index("mirror-public") < seen.index("mirror-narrower"),
+          "the report prints the dangerous direction first")
+    check("OLDT" not in seen and "NEWT" not in seen,
+          "no token reaches stdout in a mirror run  <-- pinned defect")
+    check(all("token=OLDT" in t for t in old_p.targets)
+          and not any("NEWT" in t for t in old_p.targets),
+          "a token for one portal is never sent to the other  <-- pinned defect")
+    check(all("token=NEWT" in t for t in new_p.targets)
+          and not any("OLDT" in t for t in new_p.targets),
+          "the new portal gets only its own token")
+    allowed = ("/search", "/community/groups", "/portals/self")
+    check(len(old_p.targets) > 3 and len(new_p.targets) > 3,
+          "the socket stub recorded the requests the assertions below read")
+    check(all(t.partition("?")[0].endswith(allowed)
+              for t in old_p.targets + new_p.targets) and not old_p.posted
+          and not new_p.posted,
+          "a mirror run makes only search, community/groups and portals/self "
+          "calls and posts nothing")
+
+    # the same run in process, to see which host each request was pinned to
+    class Router(object):
+        """Routes a request to the portal for its host and records the pin."""
+
+        def __init__(self, portals):
+            self.portals = portals
+            self.seen = []
+            self.pin = None
+
+        def __call__(self, insecure, pin_host=None):
+            self.pin = pin_host
+            return self
+
+        def open(self, target, data=None, timeout=None):
+            host = host_of(target)
+            self.seen.append((host, self.pin))
+            return self.portals[host].open(target, data, timeout)
+
+    r_old, r_new = mirror_pair()
+    r_old.self_fields["portalHostname"] = "old.example.org"
+    r_new.self_fields["portalHostname"] = "new.example.org:8443/arcgis"
+    routed = Router({"old.example.org": r_old, "new.example.org": r_new})
+    code, seen = captured(lambda: serving(routed, lambda: main(
+        ["mirror", "--old-url", "https://old.example.org", "--new-url",
+         "https://new.example.org:8443", "--verify-host", "NEW.example.org"])))
+    check(code == 1 and len(routed.seen) > 10
+          and all(host == pin for host, pin in routed.seen),
+          "every request of a mirror run is pinned to the host it is sent to")
+    check({host for host, _pin in routed.seen}
+          == {"old.example.org", "new.example.org"},
+          "both portals were read")
+
+    mirror_dir = tempfile.mkdtemp(prefix="sharewatch-mirror-")
+    try:
+        here = os.getcwd()
+        os.chdir(mirror_dir)
+        try:
+            run_mirror(*mirror_pair())
+            left_behind = os.listdir(mirror_dir)
+        finally:
+            os.chdir(here)
+        check(left_behind == [],
+              "a mirror run leaves no file behind, so nothing writes but --apply")
+
+        # the replies a migration script saved, checked against the new portal
+        saved = os.path.join(mirror_dir, "replies.json")
+        with io.open(saved, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"itemId": "n-roads",
+                                     "notSharedWith": ["n-g9"]}))
+        code, seen = run_mirror(*mirror_pair(), extra=["--responses", saved])
+        check("mirror-notshared" in seen and "not shared with n-g9" in seen,
+              "a saved 200 that carried notSharedWith is reported next to the "
+              "live comparison")
+        with io.open(saved, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps([saved_replies[0]]))
+        code, seen = run_mirror(*mirror_pair(), extra=["--responses", saved])
+        check("mirror-notshared" in seen, "a list of saved responses is read")
+        with io.open(saved, "w", encoding="utf-8") as handle:
+            handle.write("[3]")
+        code, seen = run_mirror(*mirror_pair(), extra=["--responses", saved])
+        check(code == 64 and "JSON object" in seen,
+              "a saved response that is not an object is a usage error")
+        code, seen = run_mirror(*mirror_pair(), extra=[
+            "--responses", os.path.join(mirror_dir, "none.json")])
+        check(code == 64 and "error:" in seen,
+              "a missing responses file is a usage error, not a traceback")
+    finally:
+        shutil.rmtree(mirror_dir, ignore_errors=True)
+
+    # identical portals are a quiet run, not a failure
+    same_old = FakePortal(rows_of(old_mirror_items),
+                          list(OLD_MIRROR["groups"].values()), org="OLDORG")
+    clone_rows = [dict(r, id=r["id"].replace("o-", "n-"),
+                       _groups=[g.replace("o-", "n-") for g in r["_groups"]])
+                  for r in rows_of(old_mirror_items)]
+    clone_groups = [dict(g, id=g["id"].replace("o-", "n-"))
+                    for g in OLD_MIRROR["groups"].values()]
+    code, seen = run_mirror(same_old, FakePortal(clone_rows, clone_groups,
+                                                 org="NEWORG"))
+    check(code == 1 and "2 not compared" in seen,
+          "two portals that share alike still report the ambiguous title")
+    quiet_old = FakePortal([r for r in rows_of(old_mirror_items)
+                            if not r["id"].startswith("o-dup")],
+                           list(OLD_MIRROR["groups"].values()), org="OLDORG")
+    quiet_new = FakePortal([r for r in clone_rows if "dup" not in r["id"]],
+                           clone_groups, org="NEWORG")
+    code, seen = run_mirror(quiet_old, quiet_new)
+    check(code == 0 and "The new portal shares what the old one did." in seen,
+          "two portals that share alike exit 0 and say so")
+
+    # refusals before and after the first call
+    code, seen = run_mirror(*mirror_pair(), verify="elsewhere.example.org")
+    check(code == 64 and "not the verified host" in seen,
+          "a --verify-host that is not the new url's host is refused")
+    code, seen = run_mirror(*mirror_pair(), verify="127.0.0.2")
+    check(code == 64, "a --verify-host naming the old host is refused")
+    pre_old, pre_new = mirror_pair()
+    code, seen = run_mirror(pre_old, pre_new, verify="elsewhere.example.org")
+    check(not pre_old.targets and not pre_new.targets,
+          "a host refusal is made before any request is sent  <-- pinned defect")
+
+    liar_old, liar_new = mirror_pair()
+    liar_new.self_fields["portalHostname"] = "old.example.org"
+    code, seen = run_mirror(liar_old, liar_new)
+    check(code == 2 and "declares old.example.org" in seen
+          and "Refusing to compare" in seen,
+          "a new url that answers but declares another host is refused, so a "
+          "DNS alias left on the old portal is caught  <-- pinned defect")
+    check(not liar_new.searches and not liar_old.searches,
+          "nothing is searched once the new portal fails the host proof")
+    mute_old, mute_new = mirror_pair()
+    mute_new.self_fields["portalHostname"] = ""
+    code, seen = run_mirror(mute_old, mute_new)
+    check(code == 2 and "declares no host" in seen,
+          "a portal that declares no host cannot be proven, so it is refused")
+    twin_old, twin_new = mirror_pair()
+    twin_old.self_fields["portalHostname"] = "127.0.0.1"
+    code, seen = run_mirror(twin_old, twin_new)
+    check(code == 2 and "old url answers as the verified host" in seen
+          and not twin_old.searches and not twin_new.searches,
+          "an old url that declares the verified host is refused before "
+          "anything is searched  <-- pinned defect")
+
+    nameless_old, nameless_new = mirror_pair(org=None)
+    code, seen = run_mirror(nameless_old, nameless_new)
+    check(code == 2 and "pass --new-query" in seen,
+          "a portal that will not name its org fails with advice")
+    code, seen = run_mirror(nameless_old, nameless_new,
+                            extra=["--new-query", "owner:jsmith"])
+    check(code == 1 and "query: owner:jsmith" in seen,
+          "an explicit --new-query is used as given")
+    code, seen = run_mirror(*mirror_pair(), extra=["--old-query", "owner:kpatel"])
+    check("query: owner:kpatel" in seen and "query: orgid:NEWORG" in seen,
+          "--old-query changes the old side only")
+
+    down_old, down_new = mirror_pair(fail_search_after=1)
+    code, seen = run_mirror(down_old, down_new, ["--new-token", "SECRETTOKEN"])
+    check(code == 2 and "SECRETTOKEN" not in seen,
+          "a token that dies while reading the new portal exits 2 and prints "
+          "no token")
+
+    cut_old, cut_new = mirror_pair(reported_total=SEARCH_CEILING)
+    code, seen = run_mirror(cut_old, cut_new)
+    check("WARNING: the new snapshot reached the 10000 result ceiling" in seen,
+          "a portal read to the ceiling is warned about before the findings")
+
+    odd_old, odd_new = mirror_pair()
+    odd_new.items[0]["access"] = "everyone"
+    code, seen = run_mirror(odd_old, odd_new)
+    check(code == 64 and "unknown access level" in seen,
+          "a sharing level this version does not know stops the mirror")
+
+    wide_title = chr(0x6c34) + " Roads"
+    jp_old, jp_new = mirror_pair()
+    jp_old.items[0].update(title=wide_title, access="org")
+    jp_new.items[0].update(title=wide_title, access="public")
+    code, seen = run_mirror(jp_old, jp_new, encoding="cp1252")
+    check(chr(0x6c34) not in seen and "? Roads" in seen,
+          "a title a cp1252 console cannot encode is replaced in a mirror report")
+
+    with env_set(SECRET_ENV_OLD, "hunter2"), env_set(SECRET_ENV_NEW, "hunter2"):
+        in_old, in_new = mirror_pair()
+        code, seen = run_mirror(in_old, in_new, ["--old-username", "olduser",
+                                                 "--new-username", "newuser"])
+        check(code == 1 and "username=olduser" in in_old.posted[0]
+              and "username=newuser" in in_new.posted[0],
+              "each portal is signed in with its own user and password")
+        check(len(in_old.posted) == 1 and len(in_new.posted) == 1
+              and all(t.partition("?")[0].endswith(allowed + ("/generateToken",))
+                      for t in in_old.targets + in_new.targets),
+              "with a sign-in the only extra call is one generateToken POST "
+              "per portal")
+        check("hunter2" not in seen and not any(
+            "password" in t for t in in_old.targets + in_new.targets),
+            "the password reaches neither stdout nor a url  <-- pinned defect")
+    check(SECRET_ENV_OLD not in os.environ and SECRET_ENV_NEW not in os.environ,
+          "the borrowed password variables are removed again")
+    with env_set(SECRET_ENV_OLD, "kept"):
+        with env_set(SECRET_ENV_OLD, "borrowed"):
+            check(os.environ[SECRET_ENV_OLD] == "borrowed", "a value is borrowed")
+        check(os.environ[SECRET_ENV_OLD] == "kept",
+              "a variable the operator already had is put back, not eaten")
+
+    # usage errors
+    needed = [("--old-url", "http://a.example.org"),
+              ("--new-url", "http://b.example.org"),
+              ("--verify-host", "b.example.org")]
+    for missing in range(3):
+        flat = ["mirror"] + [x for n, kv in enumerate(needed) if n != missing
+                             for x in kv]
+        code, seen = captured(lambda: main(flat))
+        check(code == 64 and needed[missing][0] in seen,
+              "mirror without %s is a usage error that names it"
+              % needed[missing][0])
+    full = ["mirror"] + [x for kv in needed for x in kv]
+    code, seen = captured(lambda: main(full + ["--apply"]))
+    check(code == 64 and "writes nothing" in seen,
+          "mirror with --apply is refused, there is nothing for it to write")
+    code, seen = captured(lambda: main(
+        ["mirror", "--old-url", "a.example.org", "--new-url",
+         "http://b.example.org", "--verify-host", "b.example.org"]))
+    check(code == 64 and "must start with https://" in seen,
+          "a portal url with no scheme is refused before any request is built")
+    code, seen = captured(lambda: main(full + ["--insecure", "--new-username",
+                                               "u"]))
+    check(code == 64 and "unverified connection" in seen,
+          "--insecure with --new-username is refused too, as with --username")
+    code, seen = captured(lambda: main(
+        ["mirror", "--old-url", "http://a.example.org", "--new-url",
+         "http://b.example.org", "--verify-host", "c.example.org"]))
+    check(code == 64 and "not the verified host" in seen,
+          "a verify host that is not the new host is refused in the shell too")
+
     # ---- the harness itself, which has to be able to report red
     #
     # A self-test whose failure path is never exercised is not a control: it
@@ -1859,15 +2695,30 @@ def self_test():
     check(returned == ["", ""],
           "a portal call that did not raise yields no message to assert on")
 
+    # The verdict is pure, so its red branch is exercised here with a made-up
+    # failure instead of being reachable only when the tool is already broken.
+    check(_verdict(5, []) == (["5 assertions, 0 failed"], 0),
+          "a clean tally prints one line and exits 0")
+    check(_verdict(2, ["x"]) == (["3 assertions, 1 failed", "  FAILED: x"], 1),
+          "a failed tally lists the failure and exits 1  <-- pinned defect")
+    modules = runpy.run_path(os.path.abspath(__file__), run_name="sharewatch_import")
+    check(callable(modules["main"]),
+          "importing the file runs nothing and does not exit")
+
     print("-" * 68)
-    total = passed[0] + len(failed)
+    lines, code = _verdict(passed[0], failed)
+    for line in lines:
+        print(line)
+    return code
+
+
+def _verdict(passed, failed):
+    """The closing lines of the self-test and its exit code."""
+    total = passed + len(failed)
     if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for f in failed:
-            print("  FAILED: %s" % f)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+        return (["%d assertions, %d failed" % (total, len(failed))]
+                + ["  FAILED: %s" % f for f in failed]), 1
+    return ["%d assertions, 0 failed" % total], 0
 
 
 # ----------------------------------------------------------------------- cli
@@ -1881,9 +2732,10 @@ def _parse(argv):
         epilog="Read-only. There is no flag that changes sharing. The password "
                "is never a flag: export %s or answer the prompt." % SECRET_ENV,
     )
-    ap.add_argument("mode", nargs="?", choices=["snapshot", "diff", "watch"],
+    ap.add_argument("mode", nargs="?", choices=["snapshot", "diff", "watch", "mirror"],
                     help="snapshot writes one, diff compares two, watch takes a "
-                         "fresh one and compares it with the newest in --dir")
+                         "fresh one and compares it with the newest in --dir, "
+                         "mirror compares two portals and writes nothing")
     ap.add_argument("paths", nargs="*", default=[],
                     help="for diff: the older snapshot then the newer one")
     ap.add_argument("--url", help="portal url, e.g. https://county.maps.arcgis.com")
@@ -1894,6 +2746,34 @@ def _parse(argv):
                     help="generate a token for this user. The password comes "
                          "from %s or an unechoed prompt, never from argv."
                          % SECRET_ENV)
+    ap.add_argument("--old-url", dest="old_url",
+                    help="mirror: the portal being left, including https://")
+    ap.add_argument("--new-url", dest="new_url",
+                    help="mirror: the portal being checked, including https://")
+    ap.add_argument("--verify-host", dest="verify_host",
+                    help="mirror: the bare host name the new portal must be on. "
+                         "The run is refused if --new-url is another host, if "
+                         "--old-url is this host, if the new portal declares a "
+                         "different host, or if a redirect leaves the host.")
+    ap.add_argument("--old-token", dest="old_token",
+                    help="mirror: an existing token for the old portal")
+    ap.add_argument("--new-token", dest="new_token",
+                    help="mirror: an existing token for the new portal")
+    ap.add_argument("--old-username", dest="old_username",
+                    help="mirror: generate a token on the old portal. The "
+                         "password comes from %s or a prompt." % SECRET_ENV_OLD)
+    ap.add_argument("--new-username", dest="new_username",
+                    help="mirror: generate a token on the new portal. The "
+                         "password comes from %s or a prompt." % SECRET_ENV_NEW)
+    ap.add_argument("--old-query", dest="old_query",
+                    help="mirror: search query on the old portal (default: "
+                         "its org id)")
+    ap.add_argument("--new-query", dest="new_query",
+                    help="mirror: search query on the new portal (default: "
+                         "its org id)")
+    ap.add_argument("--responses",
+                    help="mirror: a JSON file of share-call responses saved by "
+                         "the migration script, checked for notSharedWith")
     ap.add_argument("--out", help="directory to write the snapshot into")
     ap.add_argument("--dir", help="directory of snapshots, for watch")
     ap.add_argument("--window-minutes", dest="window_minutes", type=int,
@@ -1912,14 +2792,19 @@ def _parse(argv):
     return ap.parse_args(argv)
 
 
+def _sign_in(url, token, username, insecure, env=SECRET_ENV, pin_host=None):
+    """Return a token, or None for an anonymous read."""
+    if token:
+        return token
+    if not username:
+        return None
+    secret = read_secret(username, env)
+    return generate_token(url, username, secret, insecure, pin_host)
+
+
 def _authenticate(args):
     """Return a token, or None for an anonymous read."""
-    if args.token:
-        return args.token
-    if not args.username:
-        return None
-    secret = read_secret(args.username)
-    return generate_token(args.url, args.username, secret, args.insecure)
+    return _sign_in(args.url, args.token, args.username, args.insecure)
 
 
 def _snapshot(args):
@@ -1931,10 +2816,15 @@ def _snapshot(args):
         if not oid:
             raise RuntimeError("could not read the org id, pass --query")
         query = "orgid:%s" % oid
-    print("reading %s" % args.url)
+    return _read(args.url, token, query, args.insecure)
+
+
+def _read(url, token, query, insecure, pin_host=None):
+    """Read one org into a snapshot and print what it covers."""
+    print("reading %s" % url)
     print("query: %s" % query)
-    snapshot = take_snapshot(args.url, query, token, args.insecure,
-                             echo=lambda line: print(line))
+    snapshot = take_snapshot(url, query, token, insecure,
+                             echo=lambda line: print(line), pin_host=pin_host)
     print("%d item(s), %d group(s), reported total %d"
           % (len(snapshot["items"]), len(snapshot["groups"]),
              snapshot["reported_total"]))
@@ -1980,6 +2870,99 @@ def _report(old, new, window_minutes):
     return exit_code(events)
 
 
+def load_responses(path):
+    """Read a file of saved share responses: one JSON object, or a list of them."""
+    with io.open(path, "r", encoding="utf-8") as handle:
+        bodies = json.load(handle)
+    return [bodies] if isinstance(bodies, dict) else bodies
+
+
+def _open_side(args, side, verify):
+    """Sign in to one portal and prove which portal it is, before reading it.
+
+    The new side has to declare the verified host, and the old side must not.
+    Both are proved before either is read, so a wrong url costs no paging.
+    Returns what the read needs: url, token, the pinned host and portals/self.
+    """
+    url = getattr(args, side + "_url")
+    pin = host_of(url)
+    env = SECRET_ENV_OLD if side == "old" else SECRET_ENV_NEW
+    token = _sign_in(url, getattr(args, side + "_token"),
+                     getattr(args, side + "_username"), args.insecure, env, pin)
+    described = portal_self(url, token, args.insecure, pin)
+    declared = declared_hosts(described)
+    if side == "new" and verify not in declared:
+        raise RuntimeError("the new portal declares %s, not the verified host "
+                           "%s. Refusing to compare." % (
+                               ", ".join(sorted(declared)) or "no host", verify))
+    if side == "old" and verify in declared:
+        raise RuntimeError("the old url answers as the verified host %s. "
+                           "Refusing to compare." % verify)
+    return url, token, pin, described
+
+
+def _read_side(args, side, opened):
+    """Read one proved portal into a snapshot. Each side is pinned to its host."""
+    url, token, pin, described = opened
+    query = getattr(args, side + "_query")
+    if not query:
+        if not described.get("id"):
+            raise RuntimeError("could not read the org id of the %s portal, "
+                               "pass --%s-query" % (side, side))
+        query = "orgid:%s" % described["id"]
+    print("\n%s portal on host %s" % (side, pin))
+    return _read(url, token, query, args.insecure, pin)
+
+
+def _mirror(args):
+    """Compare two portals, read-only. Exit 0 identical sharing, 1 findings."""
+    for flag in ("old_url", "new_url", "verify_host"):
+        if not getattr(args, flag):
+            print("error: --%s is required for mirror." % flag.replace("_", "-"),
+                  file=sys.stderr)
+            return 64
+    if args.apply:
+        print("error: mirror writes nothing, so --apply has no meaning here.",
+              file=sys.stderr)
+        return 64
+    for url in (args.old_url, args.new_url):
+        if not is_http_url(url):
+            print("error: a portal url must start with https:// or http://, "
+                  "got %r." % url, file=sys.stderr)
+            return 64
+    try:
+        verify = check_hosts(args.old_url, args.new_url, args.verify_host)
+        bodies = load_responses(args.responses) if args.responses else []
+    except (IOError, OSError, ValueError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 64
+    try:
+        opened_old = _open_side(args, "old", verify)
+        opened_new = _open_side(args, "new", verify)
+        old = _read_side(args, "old", opened_old)
+        new = _read_side(args, "new", opened_new)
+    except RuntimeError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    print("\nold %s  ->  new %s (verified host %s)"
+          % (host_of(args.old_url), host_of(args.new_url), verify))
+    print("-" * 68)
+    for line in truncation_warning(old, new, ("old", "new")):
+        print(line)
+    try:
+        events, stats = mirror_diff(old, new, args.window_minutes)
+        events = rank_events(events + share_response_findings(bodies, new))
+    except ValueError as exc:
+        print("error: %s. The comparison would be wrong." % exc, file=sys.stderr)
+        return 64
+    print("%(paired)d paired, %(old_only)d only on the old portal, %(new_only)d "
+          "only on the new, %(ambiguous)d not compared (ambiguous title)" % stats)
+    encoding = getattr(sys.stdout, "encoding", None)
+    for line in describe(events, "The new portal shares what the old one did."):
+        print(printable(line, encoding))
+    return exit_code(events)
+
+
 def main(argv=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
 
@@ -1993,10 +2976,14 @@ def main(argv=None):
     if args.window_minutes < 0:
         print("error: --window-minutes cannot be negative.", file=sys.stderr)
         return 64
-    if args.insecure and args.username:
+    if args.insecure and (args.username or args.old_username
+                          or args.new_username):
         print("error: --insecure with --username would post your password down "
               "an unverified connection. Pass --token instead.", file=sys.stderr)
         return 64
+
+    if args.mode == "mirror":
+        return _mirror(args)
 
     if args.mode == "diff":
         if len(args.paths) != 2:
