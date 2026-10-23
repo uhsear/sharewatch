@@ -137,6 +137,7 @@ SEVERITY = {
     "mirror-group-lost": 45,  # in a group on the old portal, not on the new one
     "mirror-group-extra": 35,  # in a group on the new portal, not on the old one
     "mirror-new-public": 30,  # public on the new portal and not on the old at all
+    "mirror-new-shared": 28,  # org or group shared on the new portal, absent on the old
     "mirror-ambiguous": 30,   # two items share a title and type, so no pairing
 }
 
@@ -152,7 +153,8 @@ UNTIMED_KINDS = frozenset(["item-deleted", "item-joined-group", "item-left-group
                            "mirror-public", "mirror-notshared", "mirror-wider",
                            "mirror-narrower", "mirror-no-group", "mirror-missing",
                            "mirror-group-lost", "mirror-group-extra",
-                           "mirror-new-public", "mirror-ambiguous"])
+                           "mirror-new-public", "mirror-new-shared",
+                           "mirror-ambiguous"])
 
 SNAPSHOT_PREFIX = "sharewatch-"
 SNAPSHOT_SUFFIX = ".json"
@@ -269,15 +271,20 @@ def truncation_warning(old, new, labels=("older", "newer")):
     return lines
 
 
-def coverage_gaps(old, new, labels=("older", "newer")):
+def coverage_gaps(old, new, labels=("older", "newer"),
+                  empty="the %s snapshot holds no items"):
     """Why a result with no findings cannot be called clean, as short phrases.
 
     A snapshot cut short or read without a token holds only part of the org, so
     two of them can agree and still hide a widening. "Nothing found" is not
-    "nothing there" until both reads were whole.
+    "nothing there" until both reads were whole. A snapshot with no items at all
+    is the extreme case: a mistyped query or an account that sees nothing reads
+    the same way every day and would otherwise report a quiet org forever.
     """
     gaps = []
     for label, snapshot in zip(labels, (old, new)):
+        if not snapshot.get("items"):
+            gaps.append(empty % label)
         if snapshot.get("truncated"):
             gaps.append("the %s snapshot is incomplete" % label)
         if snapshot.get("anonymous"):
@@ -748,10 +755,17 @@ def mirror_diff(old, new, window_minutes=DEFAULT_WINDOW_MINUTES):
         if not olds:
             stats["new_only"] += len(news)
             for it in news:
-                if it.get("access") == "public":
-                    findings.append(_finding(
-                        "mirror-new-public", it,
-                        "public on the new portal, not on the old one at all"))
+                level = it.get("access", "private")
+                if access_rank(level) == 0:
+                    continue
+                # An item the old account cannot see also has no old
+                # counterpart, so a non-private one is reported, not counted.
+                kind = ("mirror-new-public" if level == "public"
+                        else "mirror-new-shared")
+                findings.append(_finding(
+                    kind, it, "%s on the new portal, not on the old one at "
+                    "all (or hidden from the old account)"
+                    % ("public" if level == "public" else level)))
             continue
         if not news:
             stats["old_only"] += len(olds)
@@ -810,13 +824,21 @@ def _group_events(old, new):
     Items in a public group are visible to anyone, so a group that is private
     on the old portal and public on the new one exposes its contents however
     the items themselves are shared. Groups are paired by title like items, and
-    a title that two groups share on either side is skipped, not guessed.
+    a title that two groups share on either side is not guessed: it is reported
+    as ambiguous, because a skip that says nothing reads as "nothing changed".
     Narrowing of membershipAccess is not reported, as in the single-portal diff.
     """
     old_by, new_by = _groups_by_title(old), _groups_by_title(new)
     events = []
     for norm in sorted(set(old_by) & set(new_by)):
         if len(old_by[norm]) > 1 or len(new_by[norm]) > 1:
+            events.append(Event(
+                "mirror-ambiguous", "", "%d old and %d new groups share this "
+                "title, so none was compared" % (len(old_by[norm]),
+                                                 len(new_by[norm])),
+                items=[], group=new_by[norm][0][0],
+                group_title=new_by[norm][0][1].get("title", ""),
+                item_count=sum(items_in_group(new, g) for g, _ in new_by[norm])))
             continue
         was, (gid, now) = old_by[norm][0][1], new_by[norm][0]
         changes = []
@@ -1006,8 +1028,8 @@ def portal_self(url, token, insecure=False, pin_host=None):
                  pin_host=pin_host)
 
 
-def org_id(url, token, insecure=False):
-    return portal_self(url, token, insecure).get("id")
+def org_id(url, token, insecure=False, pin_host=None):
+    return portal_self(url, token, insecure, pin_host).get("id")
 
 
 def search_items(url, query, token, insecure=False, echo=None, pin_host=None):
@@ -1144,7 +1166,30 @@ def write_snapshot(snapshot, directory, when):
 
 # ------------------------------------------------------------------ self-test
 
+@contextlib.contextmanager
+def _scrubbed_environment(prefix="SHAREWATCH_"):
+    """Hide the operator's own SHAREWATCH_* variables, then put them back.
+
+    The README tells operators to export a token or password, and the
+    self-test must not read it: with one exported, assertions about "no
+    credential" failed and a mirror assertion crashed.
+    """
+    saved = dict((k, v) for k, v in os.environ.items() if k.startswith(prefix))
+    for name in saved:
+        del os.environ[name]
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
 def self_test():
+    """Run the assertions with the operator's credentials out of the way."""
+    with _scrubbed_environment():
+        return _self_test()
+
+
+def _self_test():
     """Assertions over the decision core. No portal, no network, no credentials."""
     passed = [0]
     failed = []
@@ -2109,9 +2154,41 @@ def self_test():
         code, seen = captured(lambda: serving(
             FakePortal(small, portal_groups),
             lambda: main(["watch", "--url", PORTAL, "--dir", empty_dir])))
-        check(code == 0 and "the baseline" in seen,
-              "a watch directory that exists but holds no snapshot is a "
-              "baseline run, not a diff against nothing")
+        check(code == 3 and "nothing was compared" in seen
+              and "This one is the baseline" not in seen
+              and os.listdir(empty_dir) == [],
+              "watch without --apply and without a baseline compares nothing: "
+              "it says so and exits 3, never 'this one is the baseline'  "
+              "<-- pinned defect")
+        code, seen = captured(lambda: serving(
+            FakePortal(small, portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", empty_dir,
+                          "--apply"])))
+        check(code == 0 and "This one is the baseline" in seen
+              and len(snapshots_in(empty_dir)) == 1,
+              "a watch directory that holds no snapshot is a baseline run, "
+              "not a diff against nothing")
+        void_dir = os.path.join(workdir, "void")
+        code, seen = captured(lambda: serving(
+            FakePortal([], portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", void_dir,
+                          "--apply"])))
+        check(code == 3 and "returned no items" in seen,
+              "a baseline of zero items proves nothing and exits 3  "
+              "<-- pinned defect")
+        code, seen = captured(lambda: serving(
+            FakePortal([], portal_groups),
+            lambda: main(["watch", "--url", PORTAL, "--dir", void_dir,
+                          "--apply"])))
+        check(code == 3 and "the older snapshot holds no items" in seen
+              and "No sharing changes" not in seen,
+              "two empty watch runs in a row are not a quiet org  "
+              "<-- pinned defect")
+        code, seen = captured(lambda: serving(
+            FakePortal([], portal_groups),
+            lambda: main(["snapshot", "--url", PORTAL, "--query", "orgid:typo"])))
+        check(code == 3 and "returned no items" in seen,
+              "a snapshot of zero items exits 3, not 0  <-- pinned defect")
         code, seen = captured(lambda: serving(
             FakePortal(open_error=lambda t: ValueError("unknown url type: %r" % t)),
             lambda: main(["watch", "--url", PORTAL, "--dir", watched,
@@ -2173,6 +2250,14 @@ def self_test():
         code, seen = captured(lambda: main(["diff", older, older]))
         check(code == 0 and "No sharing changes" in seen,
               "a quiet diff exits 0 and says so in one line")
+        void = put("void.json", build_snapshot(PORTAL, "2026-09-14T06:00:00Z",
+                                               {}, {}, 0, False))
+        code, seen = captured(lambda: main(["diff", void, void]))
+        check(code == 3 and "Cannot tell" in seen
+              and "the newer snapshot holds no items" in seen
+              and "No sharing changes" not in seen,
+              "a diff of two snapshots with no items cannot call the org "
+              "quiet: it exits 3  <-- pinned defect")
         spread_old = put("spread1.json", wide_old)
         spread_new = put("spread2.json", wide_new)
         code, seen = captured(lambda: main(["diff", spread_old, spread_new]))
@@ -2369,6 +2454,42 @@ def self_test():
           "a public item that exists only on the new portal is reported")
     check(not any(i["title"] == "Quiet" for ev in mirrored for i in ev.items),
           "a private item that exists only on the new portal is only counted")
+    for n_old, n_new in ((1, 2), (2, 1)):
+        side_old = dict(("o%d" % n, item("o%d" % n, "o", "private", day1,
+                                         title="Twin")) for n in range(n_old))
+        side_new = dict(("n%d" % n, item("n%d" % n, "o", "public", day1,
+                                         title="Twin")) for n in range(n_new))
+        twin, tstats = mirror_diff(
+            build_snapshot("u", "t", side_old, {}, n_old, False),
+            build_snapshot("u", "t", side_new, {}, n_new, False))
+        check([ev.kind for ev in twin] == ["mirror-ambiguous"]
+              and tstats["paired"] == 0 and tstats["ambiguous"] == n_new,
+              "%d old against %d new items sharing a title and type are "
+              "reported, never paired by guess  <-- pinned defect"
+              % (n_old, n_new))
+    hidden_new = dict((i["id"], i) for i in (
+        item("h-org", "o", "org", day1, title="Hidden Org"),
+        item("h-shr", "o", "shared", day1, title="Hidden Shared"),
+        item("h-pri", "o", "private", day1, title="Hidden Private")))
+    hidden, hstats = mirror_diff(
+        build_snapshot("u", "t", {"x": item("x", "o", "private", day1,
+                                            title="Other")}, {}, 1, False),
+        build_snapshot("u", "t", hidden_new, {}, 3, False))
+    check(sorted((ev.kind, i["title"]) for ev in hidden for i in ev.items
+                 if ev.kind == "mirror-new-shared")
+          == [("mirror-new-shared", "Hidden Org"),
+              ("mirror-new-shared", "Hidden Shared")]
+          and not any(i["title"] == "Hidden Private"
+                      for ev in hidden for i in ev.items),
+          "an org or group shared item that exists only on the new portal is "
+          "reported, because the old account may simply not see it  "
+          "<-- pinned defect")
+    raises(lambda: mirror_diff(
+        build_snapshot("u", "t", {}, {}, 0, False),
+        build_snapshot("u", "t", {"x": item("x", "o", "everyone", day1)},
+                       {}, 1, False)),
+        "an unknown level on an item that only the new portal has is refused, "
+        "as it is for a pair")
     same, sstats = mirror_diff(OLD_MIRROR, OLD_MIRROR)
     check([ev.kind for ev in same] == ["mirror-ambiguous"]
           and sstats["paired"] == 9,
@@ -2449,6 +2570,7 @@ def self_test():
     # 127.0.0.1: one machine, two host names.
     class StubHandler(http.server.BaseHTTPRequestHandler):
         bounce_to = ""          # where /bounce sends the caller: another host
+        bounce_all = False      # send every request there, not only /bounce
 
         def _answer(self, query):
             path = self.path.partition("?")[0]
@@ -2456,7 +2578,8 @@ def self_test():
             self.server.portal.targets.append(self.path)
             for tail, origin in (("/bounce", StubHandler.bounce_to),
                                  ("/stay", "http://127.0.0.1:%d" % port)):
-                if path.endswith(tail):
+                if path.endswith(tail) or (StubHandler.bounce_all
+                                           and tail == "/bounce"):
                     self.send_response(302)
                     self.send_header("Location", "%s/sharing/rest/portals/self"
                                      "?%s" % (origin, query))
@@ -2570,6 +2693,37 @@ def self_test():
               "the refusal names the problem and carries no token")
         check(_call(base, "stay", {}, pin_host="127.0.0.1").get("id") == "PROBE",
               "a pinned call still follows a redirect that stays on its host")
+    # snapshot and watch read one portal, so they are pinned to it as well: a
+    # redirect used to carry the token to another host and record that host's
+    # answer as this portal's snapshot
+    for mode_args, why in ((["--query", "orgid:x"], "a query"), ([], "no query")):
+        far = FakePortal(org="FAR")
+        home = FakePortal(org="HOME")
+        with listening(far, home, hosts=["127.0.0.1", "127.0.0.2"]) as (
+                pp, pq):
+            StubHandler.bounce_to = "http://127.0.0.2:%d" % pq
+            StubHandler.bounce_all = True
+            try:
+                for mode in (["snapshot"], ["watch", "--dir", workdir]):
+                    code, seen = captured(lambda: main(
+                        mode + ["--url", "http://127.0.0.1:%d" % pp,
+                                "--token", "SECRETTOK"] + mode_args))
+                    check(code == 2 and "leaves the verified host" in seen
+                          and "SECRETTOK" not in seen and home.targets == [],
+                          "%s with %s refuses a redirect to another host and "
+                          "sends it no token  <-- pinned defect"
+                          % (mode[0], why))
+                with env_set(SECRET_ENV, "SECRETPW"):
+                    code, seen = captured(lambda: main(
+                        ["snapshot", "--url", "http://127.0.0.1:%d" % pp,
+                         "--username", "someone"] + mode_args))
+                check(code == 2 and "leaves the verified host" in seen
+                      and "SECRETPW" not in seen and home.targets == []
+                      and home.posted == [],
+                      "the sign-in with %s is pinned too, so the password "
+                      "goes to no other host  <-- pinned defect" % why)
+            finally:
+                StubHandler.bounce_all = False
     check(any(isinstance(h, _PinnedRedirect) and h.host == "h"
               for h in _opener(False, "h").handlers),
           "an opener built with a pin carries the redirect guard")
@@ -3022,6 +3176,22 @@ def self_test():
     check(code == 3 and "the old portal returned no items" in seen
           and "the new portal returned no items" in seen,
           "two empty portals are not a clean mirror  <-- pinned defect")
+    shown = dict(item("n-h", "o", "org", day1, title="Hidden"), _groups=[])
+    code, seen = run_mirror(
+        FakePortal([dict(lone[0], title="Other")], [], org="OLDORG"),
+        FakePortal([shown, dict(lone[0], title="Other")], [], org="NEWORG"),
+        toks)
+    check(code == 1 and "mirror-new-shared" in seen
+          and "shares what the old one did" not in seen,
+          "an org item the old account cannot see is reported, not counted "
+          "and called clean  <-- pinned defect")
+    with env_set(TOKEN_ENV_OLD, "operator-value"):
+        with _scrubbed_environment():
+            hidden_away = TOKEN_ENV_OLD not in os.environ
+        kept = os.environ.get(TOKEN_ENV_OLD) == "operator-value"
+    check(hidden_away and kept,
+          "the self-test hides the operator's SHAREWATCH_ variables and puts "
+          "them back  <-- pinned defect")
     code, seen = run_mirror(*quiet_pair())
     check(code == 3 and "read without a token" in seen
           and "WARNING: no token" in seen
@@ -3084,11 +3254,24 @@ def self_test():
                                [group("n-g", "public", title="New")]) == [],
           "an unchanged group, a narrowed membershipAccess and a group with "
           "no twin are not reported")
-    check(mirror_groups_of([group("o-1", "private", title="Staff"),
-                            group("o-2", "private", title="Staff")],
-                           [group("n-g", "public", title="Staff")]) == [],
-          "two groups sharing a title on one side are not told apart, so "
-          "none is compared")
+    dup_old = mirror_groups_of([group("o-1", "private", title="Staff"),
+                                group("o-2", "private", title="Staff")],
+                               [group("n-g", "public", title="Staff")],
+                               [item("n-i", "o", "private", day1,
+                                     groups=["n-g"])])
+    check([ev.kind for ev in dup_old] == ["mirror-ambiguous"]
+          and "2 old and 1 new groups share this title" in dup_old[0].detail
+          and dup_old[0].item_count == 1,
+          "two groups sharing a title on the old side are reported, not "
+          "skipped silently: a skip that says nothing reads as clean  "
+          "<-- pinned defect")
+    dup_new = mirror_groups_of([group("o-g", "private", title="Staff")],
+                               [group("n-1", "public", title="Staff"),
+                                group("n-2", "private", title="Staff")])
+    check([ev.kind for ev in dup_new] == ["mirror-ambiguous"]
+          and "1 old and 2 new groups share this title" in dup_new[0].detail,
+          "two groups sharing a title on the new side are reported too  "
+          "<-- pinned defect")
     g_old, g_new = mirror_pair()
     g_new.groups = [dict(g, access="public") if g["id"] == "n-g1" else g
                     for g in g_new.groups]
@@ -3527,19 +3710,23 @@ def _sign_in(url, token, username, insecure, env=SECRET_ENV, pin_host=None,
 
 def _authenticate(args):
     """Return a token, or None for an anonymous read."""
-    return _sign_in(args.url, args.token, args.username, args.insecure)
+    return _sign_in(args.url, args.token, args.username, args.insecure,
+                    pin_host=host_of(args.url))
 
 
 def _snapshot(args):
     """Take a snapshot and print what it covers. Returns (snapshot, path)."""
     token = _authenticate(args)
+    # Pinned like mirror: a redirect to another host would carry the token there
+    # and record that host's answer as this portal's snapshot.
+    pin = host_of(args.url)
     query = args.query
     if not query:
-        oid = org_id(args.url, token, args.insecure)
+        oid = org_id(args.url, token, args.insecure, pin)
         if not oid:
             raise RuntimeError("could not read the org id, pass --query")
         query = "orgid:%s" % oid
-    return _read(args.url, token, query, args.insecure)
+    return _read(args.url, token, query, args.insecure, pin)
 
 
 def _read(url, token, query, insecure, pin_host=None):
@@ -3567,6 +3754,19 @@ def _read(url, token, query, insecure, pin_host=None):
               % (snapshot["reported_total"], len(snapshot["items"])))
         print("Paging a live portal is not atomic. Run it again.")
     return snapshot
+
+
+def _empty_read(snapshot):
+    """Exit code of a snapshot or baseline run: 3 when it holds no items.
+
+    A mistyped query or an account that sees nothing reads as an empty org, and
+    every later diff of two empty reads would be "no changes".
+    """
+    if snapshot["items"]:
+        return 0
+    print("\nWARNING: the read returned no items, so it proves nothing. Check "
+          "--query and the account.")
+    return 3
 
 
 def _write(snapshot, directory, apply_it):
@@ -3708,10 +3908,8 @@ def _mirror(args):
     # did" would be a false sentence. An empty old side is the dangerous one:
     # private items that exist only on the new portal are counted, never
     # reported.
-    gaps = coverage_gaps(old, new, ("old", "new"))
-    for label, side in (("old", old), ("new", new)):
-        if not side["items"]:
-            gaps.append("the %s portal returned no items" % label)
+    gaps = coverage_gaps(old, new, ("old", "new"),
+                         "the %s portal returned no items")
     encoding = getattr(sys.stdout, "encoding", None)
     quiet = verdict_text(gaps, "The new portal shares what the old one did.")
     for line in describe(events, quiet):
@@ -3742,7 +3940,7 @@ def _run(args):
         return self_test()
 
     if not args.mode:
-        print("error: a mode is required: snapshot, diff or watch. Use "
+        print("error: a mode is required: snapshot, diff, watch or mirror. Use "
               "--self-test to verify the tool without a portal.", file=sys.stderr)
         return 64
     if args.window_minutes < 0:
@@ -3791,7 +3989,7 @@ def _run(args):
         except (RuntimeError, OSError) as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
-        return 0
+        return _empty_read(snapshot)
 
     # watch: a fresh snapshot against the newest file already in --dir
     if not args.dir:
@@ -3833,8 +4031,16 @@ def _run(args):
         print("error: %s" % unreadable, file=sys.stderr)
         return 64
     if baseline is None:
+        if not args.apply:
+            # Nothing was written, so the next run finds no baseline either.
+            # "This one is the baseline" would be false, and exit 0 would let a
+            # schedule that lacks --apply report a quiet org forever.
+            print("\nNo earlier snapshot in %s, and without --apply none is "
+                  "written, so nothing was compared. Run once with --apply "
+                  "to write the baseline." % args.dir)
+            return 3
         print("\nNo earlier snapshot in %s. This one is the baseline." % args.dir)
-        return 2 if write_failed else 0
+        return 2 if write_failed else _empty_read(snapshot)
     print("\nbaseline: %s" % previous)
     code = _report(baseline, snapshot, args.window_minutes)
     return 2 if write_failed and code != 1 else code
