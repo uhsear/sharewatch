@@ -24,9 +24,9 @@ refused if the urls, the portal's own portals/self answer or a redirect say
 otherwise. Mirror writes nothing, not even with --apply.
 
     python sharewatch.py --self-test
-    python sharewatch.py snapshot --url https://county.maps.arcgis.com --out snaps/ --apply
+    python sharewatch.py snapshot --url https://example.maps.arcgis.com --out snaps/ --apply
     python sharewatch.py diff snaps/sharewatch-20260914T060000Z.json snaps/sharewatch-20260915T060000Z.json
-    python sharewatch.py watch --url https://county.maps.arcgis.com --dir snaps/ --apply
+    python sharewatch.py watch --url https://example.maps.arcgis.com --dir snaps/ --apply
     python sharewatch.py mirror --old-url https://old.example.org --new-url https://new.example.org --verify-host new.example.org
 
 Exit codes: 0 no differences, 1 anything to read (a narrowing or a deletion is
@@ -94,9 +94,9 @@ SECRET_ENV = "SHAREWATCH_PASSWORD"
 SECRET_ENV_OLD = "SHAREWATCH_OLD_PASSWORD"
 SECRET_ENV_NEW = "SHAREWATCH_NEW_PASSWORD"
 
-# A token has the same exposure as a password, so it can come from the
-# environment as well as from --token. SSO and SAML accounts cannot use
-# generateToken, and for them a token is the only way in.
+# A token has the same exposure as a password, so it is never a flag either.
+# SSO and SAML accounts cannot use generateToken, and for them a token in the
+# environment is the only way in.
 TOKEN_ENV = "SHAREWATCH_TOKEN"
 TOKEN_ENV_OLD = "SHAREWATCH_OLD_TOKEN"
 TOKEN_ENV_NEW = "SHAREWATCH_NEW_TOKEN"
@@ -121,6 +121,7 @@ SEVERITY = {
     "item-org": 60,           # private or group-only became org-wide
     "group-org": 55,          # a private group became org-wide
     "item-joined-group": 40,  # an item was added to a group
+    "item-shared": 35,        # private became shared to groups, not to the org
     "new-item": 25,
     "item-deleted": 20,
     "item-left-group": 15,
@@ -268,6 +269,11 @@ def truncation_warning(old, new, labels=("older", "newer")):
         lines.append("It covers an unknown fraction of the org, so deletions "
                      "and new items below may")
         lines.append("be paging artefacts. Narrow --query and snapshot again.")
+    for label, snapshot in zip(labels, (old, new)):
+        if snapshot.get("groups_short"):
+            lines.append("WARNING: the %s snapshot read a group listing or a "
+                         "group's members short, so group" % label)
+            lines.append("changes below may be paging artefacts. Run it again.")
     return lines
 
 
@@ -283,13 +289,23 @@ def coverage_gaps(old, new, labels=("older", "newer"),
     """
     gaps = []
     for label, snapshot in zip(labels, (old, new)):
-        if not snapshot.get("items"):
-            gaps.append(empty % label)
-        if snapshot.get("truncated"):
-            gaps.append("the %s snapshot is incomplete" % label)
-        if snapshot.get("anonymous"):
-            gaps.append("the %s snapshot was read without a token and holds "
-                        "public items only" % label)
+        gaps.extend(snapshot_gaps(snapshot, label, empty))
+    return gaps
+
+
+def snapshot_gaps(snapshot, label, empty="the %s snapshot holds no items"):
+    """Why one snapshot cannot prove a quiet result, as short phrases."""
+    gaps = []
+    if not snapshot.get("items"):
+        gaps.append(empty % label)
+    if snapshot.get("truncated"):
+        gaps.append("the %s snapshot is incomplete" % label)
+    if snapshot.get("groups_short"):
+        gaps.append("the %s snapshot's group memberships are incomplete"
+                    % label)
+    if snapshot.get("anonymous"):
+        gaps.append("the %s snapshot was read without a token and holds "
+                    "public items only" % label)
     return gaps
 
 
@@ -363,11 +379,13 @@ def group_record(raw):
     }
 
 
-def build_snapshot(url, taken, items, groups, total, truncated, anonymous=False):
+def build_snapshot(url, taken, items, groups, total, truncated, anonymous=False,
+                   groups_short=False):
     """Assemble the snapshot document. No credential ever enters it.
 
-    "anonymous" is written only when true, so a snapshot read with a token has
-    the same bytes as before the key existed.
+    "anonymous" and "groups_short" are written only when true, so a snapshot
+    read with a token and read whole has the same bytes as before the keys
+    existed.
     """
     snapshot = {
         "sharewatch": 1,
@@ -380,6 +398,8 @@ def build_snapshot(url, taken, items, groups, total, truncated, anonymous=False)
     }
     if anonymous:
         snapshot["anonymous"] = True
+    if groups_short:
+        snapshot["groups_short"] = True
     return snapshot
 
 
@@ -543,7 +563,8 @@ def diff_snapshots(old, new, window_minutes=DEFAULT_WINDOW_MINUTES):
         if old_access != new_access:
             detail = "%s -> %s" % (old_access, new_access)
             if widened(old_access, new_access):
-                kind = "item-public" if new_access == "public" else "item-org"
+                kind = {"public": "item-public", "org": "item-org"}.get(
+                    new_access, "item-shared")
             else:
                 kind = "item-narrowed"
             findings.append(_finding(kind, new_item, detail))
@@ -827,6 +848,9 @@ def _group_events(old, new):
     a title that two groups share on either side is not guessed: it is reported
     as ambiguous, because a skip that says nothing reads as "nothing changed".
     Narrowing of membershipAccess is not reported, as in the single-portal diff.
+    A group with no same-title group on the old portal is reported when it is
+    not private, as the single-portal diff reports a new public group: a
+    migration script that creates its groups public exposes what it puts in them.
     """
     old_by, new_by = _groups_by_title(old), _groups_by_title(new)
     events = []
@@ -861,6 +885,17 @@ def _group_events(old, new):
             events.append(Event(
                 kind, now.get("owner", ""), detail, items=[], group=gid,
                 group_title=now.get("title", ""),
+                item_count=items_in_group(new, gid)))
+    for norm in sorted(set(new_by) - set(old_by)):
+        for gid, now in new_by[norm]:
+            level = now.get("access", "private")
+            if access_rank(level) == 0:
+                continue
+            events.append(Event(
+                "mirror-new-public" if level == "public"
+                else "mirror-new-shared", now.get("owner", ""),
+                "group only on the new portal, shared %s" % level, items=[],
+                group=gid, group_title=now.get("title", ""),
                 item_count=items_in_group(new, gid)))
     return events
 
@@ -1067,9 +1102,14 @@ def search_items(url, query, token, insecure=False, echo=None, pin_host=None):
 
 
 def search_groups(url, query, token, insecure=False, pin_host=None):
-    """Page /sharing/rest/community/groups the same way search is paged."""
+    """Page /sharing/rest/community/groups the same way search is paged.
+
+    Returns (groups, short): short is true when paging gave back fewer groups
+    than the portal counted.
+    """
     groups = {}
     start = 1
+    total = 0
     while start is not None:
         params = {"q": query, "start": start, "num": clamp_num(SEARCH_MAX_NUM)}
         if token:
@@ -1081,7 +1121,7 @@ def search_groups(url, query, token, insecure=False, pin_host=None):
         for raw in results:
             groups[raw.get("id")] = group_record(raw)
         start = next_start(start, len(results), total)
-    return groups
+    return groups, len(groups) < min(total, SEARCH_CEILING)
 
 
 def attach_groups(url, items, groups, token, insecure=False, echo=None,
@@ -1091,10 +1131,16 @@ def attach_groups(url, items, groups, token, insecure=False, echo=None,
     Done by searching each group's contents rather than by asking each item for
     its groups. One request per group instead of one per item is the difference
     between a snapshot that finishes and one that gets rate limited.
+
+    Returns (items, short): short is true when any group's member search was
+    cut short, because a membership that was not read looks like a membership
+    that was lost.
     """
+    short = False
     for gid in sorted(groups):
-        members, _total, _trunc = search_items(
+        members, _total, cut = search_items(
             url, "group:%s" % gid, token, insecure=insecure, pin_host=pin_host)
+        short = short or cut
         for iid in members:
             if iid in items:
                 items[iid]["groups"].append(gid)
@@ -1102,20 +1148,29 @@ def attach_groups(url, items, groups, token, insecure=False, echo=None,
             echo("  group %s: %d item(s)" % (gid, len(members)))
     for item in items.values():
         item["groups"].sort()
-    return items
+    return items, short
 
 
-def take_snapshot(url, query, token, insecure=False, echo=None, pin_host=None):
-    """Read the whole sharing posture of one org into a snapshot document."""
+def take_snapshot(url, query, token, insecure=False, echo=None, pin_host=None,
+                  group_query=None):
+    """Read the whole sharing posture of one org into a snapshot document.
+
+    group_query searches the groups. Items and groups have different search
+    fields, so an item query such as type:"Feature Service" finds no groups at
+    all, which would read as every group membership lost. Without one the item
+    query is used, as it is when it is the default orgid query.
+    """
     items, total, truncated = search_items(url, query, token, insecure=insecure,
                                            echo=echo, pin_host=pin_host)
-    groups = search_groups(url, query, token, insecure=insecure,
-                           pin_host=pin_host)
-    attach_groups(url, items, groups, token, insecure=insecure, echo=echo,
-                  pin_host=pin_host)
+    groups, listing_short = search_groups(url, group_query or query, token,
+                                          insecure=insecure, pin_host=pin_host)
+    _items, members_short = attach_groups(url, items, groups, token,
+                                          insecure=insecure, echo=echo,
+                                          pin_host=pin_host)
     taken = utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     return build_snapshot(url, taken, items, groups, total, truncated,
-                          anonymous=not token)
+                          anonymous=not token,
+                          groups_short=listing_short or members_short)
 
 
 def load_snapshot(path):
@@ -1250,7 +1305,7 @@ def _self_test():
     old_items["gone2"] = item("gone2", "mreyes", "org", day1)
     old_items["stable"] = item("stable", "gis_admin", "public", day1,
                                groups=["g-works"], title="Parcel Viewer")
-    OLD = build_snapshot("https://county.maps.arcgis.com", "2026-09-14T06:00:00Z",
+    OLD = build_snapshot("https://example.maps.arcgis.com", "2026-09-14T06:00:00Z",
                          old_items, {"g-works": group("g-works", "org"),
                                      "g-quiet": group("g-quiet", "private")},
                          len(old_items), False)
@@ -1267,7 +1322,7 @@ def _self_test():
                                title="Parcel Viewer")
     new_items["fresh"] = item("fresh", "twilson", "private", day1 + 500 * minute,
                               title="Draft Zoning")
-    NEW = build_snapshot("https://county.maps.arcgis.com", "2026-09-15T06:00:00Z",
+    NEW = build_snapshot("https://example.maps.arcgis.com", "2026-09-15T06:00:00Z",
                          new_items, {"g-works": group("g-works", "public"),
                                      "g-quiet": group("g-quiet", "private")},
                          len(new_items), False)
@@ -1337,13 +1392,13 @@ def _self_test():
           "a token is redacted the same way a password is")
     check(redact("id 12345 failed", 12345) == "id %s failed" % REDACTED,
           "a secret that is not a string is coerced, not raised on  <-- pinned defect")
-    check(is_http_url("https://county.maps.arcgis.com") is True,
+    check(is_http_url("https://example.maps.arcgis.com") is True,
           "an https portal url is accepted")
     check(is_http_url("http://gis.internal/portal") is True,
           "a plain http url is accepted, for an internal portal")
-    check(is_http_url("HTTPS://COUNTY.MAPS.ARCGIS.COM") is True,
+    check(is_http_url("HTTPS://EXAMPLE.MAPS.ARCGIS.COM") is True,
           "the scheme test ignores case")
-    check(is_http_url("county.maps.arcgis.com") is False,
+    check(is_http_url("example.maps.arcgis.com") is False,
           "a url with no scheme is refused, because urllib quotes the whole "
           "url back into its error and that url carries the token  "
           "<-- pinned defect")
@@ -1586,7 +1641,7 @@ def _self_test():
     check(a.insecure is False, "--insecure defaults to OFF")
     check(a.window_minutes == DEFAULT_WINDOW_MINUTES,
           "--window-minutes defaults to the configured value")
-    check(a.token is None and a.username is None,
+    check(a.username is None and not hasattr(a, "token"),
           "no credential is assumed when none is given")
     check(_parse(["snapshot", "--url", "x", "--apply"]).apply is True,
           "--apply is read")
@@ -1600,8 +1655,11 @@ def _self_test():
           "--dir is read")
     check(_parse(["snapshot", "--url", "x", "--query", "orgid:AB"]).query
           == "orgid:AB", "--query is read")
-    check(_parse(["snapshot", "--url", "x", "--token", "T"]).token == "T",
-          "--token is read")
+    refuses(["snapshot", "--url", "x", "--token", "T"],
+            "a token is not a flag, because argv is readable by every "
+            "process  <-- pinned defect")
+    refuses(["mirror", "--old-token", "T"], "--old-token is not a flag either")
+    refuses(["mirror", "--new-token=T"], "--new-token is not a flag either")
     check(_parse(["snapshot", "--url", "https://x"]).url == "https://x",
           "--url is read")
     check(_parse(["snapshot", "--url", "x", "--out", "snaps"]).out == "snaps",
@@ -1619,7 +1677,7 @@ def _self_test():
             "reached by abbreviation  <-- pinned defect")
     quiet_err, sys.stderr = sys.stderr, io.StringIO()
     try:
-        scheme_less = main(["snapshot", "--url", "county.maps.arcgis.com"])
+        scheme_less = main(["snapshot", "--url", "example.maps.arcgis.com"])
         bad_window = main(["diff", "a.json", "b.json", "--window-minutes", "-1"])
     finally:
         sys.stderr = quiet_err
@@ -1681,8 +1739,11 @@ def _self_test():
 
         def __init__(self, items=(), groups=(), org="ORG123", token="TESTTOKEN",
                      reported_total=None, fail_search_after=None,
-                     open_error=None, cap=100, self_fields=None, password="hunter2"):
+                     open_error=None, cap=100, self_fields=None, password="hunter2",
+                     groups_total=None, members_total=None):
             self.password = password
+            self.groups_total = groups_total      # what the group listing claims
+            self.members_total = members_total    # what a member search claims
             self.items = list(items)
             self.self_fields = dict(self_fields or {})   # host names, urlKey
             self.groups = list(groups)
@@ -1726,7 +1787,7 @@ def _self_test():
                 described.update(self.self_fields)
                 return described
             if path.endswith("/community/groups"):
-                return self._page(self.groups, params)
+                return self._page(self.groups, params, self.groups_total)
             if path.endswith("/search"):
                 self.searches += 1
                 if (self.fail_search_after is not None
@@ -1737,15 +1798,17 @@ def _self_test():
                 if query.startswith("group:"):
                     gid = query.split(":", 1)[1]
                     rows = [r for r in rows if gid in (r.get("_groups") or [])]
+                    return self._page(rows, params, self.members_total)
                 return self._page(rows, params)
             return {"error": {"code": 400, "message": "unhandled " + path}}
 
-        def _page(self, rows, params):
+        def _page(self, rows, params, claimed=None):
             start = int(params.get("start") or 1)
             num = min(int(params.get("num") or 10), self.cap)   # silent cap
             page = rows[start - 1:start - 1 + num]
-            total = (len(rows) if self.reported_total is None
-                     else self.reported_total)
+            total = claimed if claimed is not None else (
+                len(rows) if self.reported_total is None
+                else self.reported_total)
             return {"total": total, "start": start, "num": len(page),
                     "results": page}
 
@@ -1787,7 +1850,24 @@ def _self_test():
             check(False, "%s (no error raised)" % label)
         return ""
 
-    PORTAL = "https://county.maps.arcgis.com"
+    @contextlib.contextmanager
+    def env_set(name, value):
+        had, prior = name in os.environ, os.environ.get(name)
+        os.environ[name] = value
+        try:
+            yield
+        finally:
+            if had:
+                os.environ[name] = prior
+            else:
+                del os.environ[name]
+
+    def tmain(token, argv):
+        """main() with the token in the environment, the only place it can be."""
+        with env_set(TOKEN_ENV, token):
+            return main(argv)
+
+    PORTAL = "https://example.maps.arcgis.com"
     catalog = [{"id": "p%03d" % n, "title": "Layer %d" % n, "owner": "jsmith",
                 "type": "Feature Service", "access": "org", "modified": day1 + n,
                 "_groups": ["g-works"] if n < 3 else []} for n in range(250)]
@@ -1852,14 +1932,16 @@ def _self_test():
     check(not any("token=" in t for t in anonymous.targets),
           "an anonymous read sends no token parameter at all")
 
-    read_groups = serving(portal, lambda: search_groups(PORTAL, "orgid:ORG123",
-                                                        "TESTTOKEN"))
+    read_groups, groups_cut = serving(portal, lambda: search_groups(
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    check(groups_cut is False, "a whole group listing is not marked short")
     check(list(read_groups) == ["g-works"], "the org's groups are read")
     check(read_groups["g-works"]["membershipAccess"] == "org",
           "a null membershipAccess from the portal is read back as org")
 
-    attached = serving(portal, lambda: attach_groups(PORTAL, read, read_groups,
-                                                     "TESTTOKEN"))
+    attached, members_cut = serving(portal, lambda: attach_groups(
+        PORTAL, read, read_groups, "TESTTOKEN"))
+    check(members_cut is False, "whole group member lists are not marked short")
     check(attached["p000"]["groups"] == ["g-works"],
           "an item inside a group is recorded as being inside it")
     check(attached["p200"]["groups"] == [],
@@ -1881,7 +1963,8 @@ def _self_test():
     stray = serving(portal, lambda: search_items(
         PORTAL, "orgid:ORG123", "TESTTOKEN"))[0]
     del stray["p001"]
-    serving(portal, lambda: attach_groups(PORTAL, stray, read_groups, "TESTTOKEN"))
+    serving(portal, lambda: attach_groups(PORTAL, stray, read_groups,
+                                          "TESTTOKEN"))
     check("p001" not in stray and stray["p000"]["groups"] == ["g-works"],
           "a group member the org search never returned is skipped, not "
           "invented as an item with no fields")
@@ -1953,9 +2036,10 @@ def _self_test():
               and "not echoed" in prompts[0],
               "the prompt names the user and says the password is not echoed")
 
-        check(_authenticate(_parse(["snapshot", "--url", PORTAL,
-                                    "--token", "T0KEN"])) == "T0KEN",
-              "an existing --token is used as given, with no sign-in")
+        with env_set(TOKEN_ENV, "T0KEN"):
+            check(_authenticate(_parse(["snapshot", "--url", PORTAL]))
+                  == "T0KEN",
+                  "an existing token is used as given, with no sign-in")
         check(_authenticate(_parse(["snapshot", "--url", PORTAL])) is None,
               "with no credential at all the read is anonymous")
         os.environ[SECRET_ENV] = "hunter2"
@@ -2039,8 +2123,8 @@ def _self_test():
 
         small = catalog[:5]
         live = FakePortal(small, portal_groups)
-        code, seen = captured(lambda: serving(live, lambda: main(
-            ["snapshot", "--url", PORTAL, "--token", "SECRETTOKEN",
+        code, seen = captured(lambda: serving(live, lambda: tmain("SECRETTOKEN",
+            ["snapshot", "--url", PORTAL,
              "--out", workdir])))
         check(code == 0, "a snapshot run that read the org exits 0")
         check("query: orgid:ORG123" in seen,
@@ -2056,8 +2140,8 @@ def _self_test():
         check(live.insecure is False,
               "a run without --insecure verifies the certificate")
 
-        code, seen = captured(lambda: serving(live, lambda: main(
-            ["snapshot", "--url", PORTAL, "--token", "SECRETTOKEN",
+        code, seen = captured(lambda: serving(live, lambda: tmain("SECRETTOKEN",
+            ["snapshot", "--url", PORTAL,
              "--out", workdir, "--apply"])))
         written = snapshots_in(workdir)
         check(code == 0 and len(written) == 1, "--apply writes one snapshot file")
@@ -2081,12 +2165,17 @@ def _self_test():
         check(verified.insecure is False, "--insecure stays off unless asked for")
 
         explicit = FakePortal(small, portal_groups)
-        code, seen = captured(lambda: serving(explicit, lambda: main(
-            ["snapshot", "--url", PORTAL, "--query", "owner:jsmith"])))
+        code, seen = captured(lambda: serving(explicit, lambda: tmain(
+            "T0KEN", ["snapshot", "--url", PORTAL, "--query", "owner:jsmith"])))
         check(code == 0 and "query: owner:jsmith" in seen,
               "an explicit --query is used as given")
-        check(not any("portals/self" in t for t in explicit.targets),
-              "with --query the org is never asked to name itself")
+        group_calls = [t for t in explicit.targets if "community/groups" in t]
+        check(bool(group_calls) and all("q=orgid%3AORG123" in t
+                                        for t in group_calls),
+              "groups are searched by the org id even with an item --query, "
+              "because the group search has other fields  <-- pinned defect")
+        check(not any("owner" in t for t in group_calls),
+              "an item query is never sent to the group search")
 
         at_ceiling = FakePortal(catalog, portal_groups,
                                 reported_total=SEARCH_CEILING)
@@ -2102,7 +2191,7 @@ def _self_test():
               "a portal that will not name its org fails with advice, not a crash")
         code, seen = captured(lambda: serving(
             FakePortal(open_error=lambda t: ValueError("unknown url type: %r" % t)),
-            lambda: main(["snapshot", "--url", PORTAL, "--token", "SECRETTOKEN"])))
+            lambda: tmain("SECRETTOKEN", ["snapshot", "--url", PORTAL])))
         check(code == 2, "a portal that cannot be reached exits 2, not 0")
         check("SECRETTOKEN" not in seen,
               "the token is not in the error the failed run printed  "
@@ -2125,8 +2214,8 @@ def _self_test():
               "the watch directory holds nothing before the first run")
         code, seen = captured(lambda: serving(
             FakePortal(small, portal_groups),
-            lambda: main(["watch", "--url", PORTAL, "--dir", watched, "--apply",
-                          "--token", "T0KEN"])))
+            lambda: tmain("T0KEN", ["watch", "--url", PORTAL, "--dir", watched, "--apply",
+                          ])))
         check(code == 0 and "the baseline" in seen,
               "the first watch run has nothing to compare with and says so")
         check(len(snapshots_in(watched)) == 1,
@@ -2134,16 +2223,16 @@ def _self_test():
         opened_up = [dict(row, access="public") for row in small]
         code, seen = captured(lambda: serving(
             FakePortal(opened_up, portal_groups),
-            lambda: main(["watch", "--url", PORTAL, "--dir", watched, "--apply",
-                          "--token", "T0KEN"])))
+            lambda: tmain("T0KEN", ["watch", "--url", PORTAL, "--dir", watched, "--apply",
+                          ])))
         check(code == 1, "a watch run that found a widening exits 1")
         check("item-public" in seen and "5 item(s) by jsmith" in seen,
               "the watch report names what widened and who widened it")
         check("baseline: " in seen, "the watch report names the file it used")
         code, seen = captured(lambda: serving(
             FakePortal(opened_up, portal_groups),
-            lambda: main(["watch", "--url", PORTAL, "--dir", watched,
-                          "--token", "T0KEN"])))
+            lambda: tmain("T0KEN", ["watch", "--url", PORTAL, "--dir", watched,
+                          ])))
         check(code == 0 and "No sharing changes" in seen,
               "a watch run against an unchanged org exits 0")
         check("No snapshot was written" in seen,
@@ -2162,8 +2251,8 @@ def _self_test():
               "<-- pinned defect")
         code, seen = captured(lambda: serving(
             FakePortal(small, portal_groups),
-            lambda: main(["watch", "--url", PORTAL, "--dir", empty_dir,
-                          "--apply"])))
+            lambda: tmain("T0KEN", ["watch", "--url", PORTAL, "--dir", empty_dir,
+                                    "--apply"])))
         check(code == 0 and "This one is the baseline" in seen
               and len(snapshots_in(empty_dir)) == 1,
               "a watch directory that holds no snapshot is a baseline run, "
@@ -2191,8 +2280,8 @@ def _self_test():
               "a snapshot of zero items exits 3, not 0  <-- pinned defect")
         code, seen = captured(lambda: serving(
             FakePortal(open_error=lambda t: ValueError("unknown url type: %r" % t)),
-            lambda: main(["watch", "--url", PORTAL, "--dir", watched,
-                          "--token", "SECRETTOKEN"])))
+            lambda: tmain("SECRETTOKEN", ["watch", "--url", PORTAL, "--dir", watched,
+                          ])))
         check(code == 2 and "SECRETTOKEN" not in seen,
               "a watch run against an unreachable portal exits 2 and prints "
               "no token  <-- pinned defect")
@@ -2538,13 +2627,12 @@ def _self_test():
 
     # ---- the mirror parser
     m = _parse(["mirror", "--old-url", "a", "--new-url", "b", "--verify-host", "h",
-                "--old-token", "OT", "--new-token", "NT", "--old-username", "ou",
-                "--new-username", "nu", "--old-query", "oq", "--new-query", "nq",
+                "--old-username", "ou", "--new-username", "nu", "--old-query", "oq", "--new-query", "nq",
                 "--responses", "r.json"])
     check((m.old_url, m.new_url, m.verify_host) == ("a", "b", "h"),
           "--old-url, --new-url and --verify-host are read")
-    check((m.old_token, m.new_token, m.old_username, m.new_username)
-          == ("OT", "NT", "ou", "nu"), "a credential is read per portal")
+    check((m.old_username, m.new_username) == ("ou", "nu"),
+          "a user name is read per portal")
     check((m.old_query, m.new_query, m.responses) == ("oq", "nq", "r.json"),
           "--old-query, --new-query and --responses are read")
     refuses(["mirror", "--verify", "h"],
@@ -2557,9 +2645,9 @@ def _self_test():
     # ---- the pin reaches every request of a read
     pinned_portal = FakePortal(catalog[:5], portal_groups)
     serving(pinned_portal, lambda: take_snapshot(
-        PORTAL, "orgid:ORG123", "TESTTOKEN", pin_host="county.maps.arcgis.com"))
+        PORTAL, "orgid:ORG123", "TESTTOKEN", pin_host="example.maps.arcgis.com"))
     check(len(pinned_portal.pinned) == 3
-          and set(pinned_portal.pinned) == {"county.maps.arcgis.com"},
+          and set(pinned_portal.pinned) == {"example.maps.arcgis.com"},
           "the pinned host reaches every search, group and member request")
 
     # ---- the same, over a real socket
@@ -2636,18 +2724,6 @@ def _self_test():
                 server.shutdown()
                 server.server_close()
 
-    @contextlib.contextmanager
-    def env_set(name, value):
-        had, prior = name in os.environ, os.environ.get(name)
-        os.environ[name] = value
-        try:
-            yield
-        finally:
-            if had:
-                os.environ[name] = prior
-            else:
-                del os.environ[name]
-
     def rows_of(items_by_id):
         return [dict(it, _groups=list(it["groups"]))
                 for it in items_by_id.values()]
@@ -2663,9 +2739,12 @@ def _self_test():
         return old_p, new_p
 
     def run_mirror(old_p, new_p, extra=(), verify="127.0.0.1",
-                   encoding="utf-8"):
-        with listening(old_p, new_p, hosts=["127.0.0.2", "127.0.0.1"]) as (
-                po, pn):
+                   encoding="utf-8", tokens=(None, None)):
+        with contextlib.ExitStack() as stack, listening(
+                old_p, new_p, hosts=["127.0.0.2", "127.0.0.1"]) as (po, pn):
+            for name, value in zip((TOKEN_ENV_OLD, TOKEN_ENV_NEW), tokens):
+                if value:
+                    stack.enter_context(env_set(name, value))
             old_p.self_fields.setdefault("portalHostname", "127.0.0.2:%d" % po)
             new_p.self_fields.setdefault("portalHostname",
                                          "127.0.0.1:%d/arcgis" % pn)
@@ -2705,9 +2784,8 @@ def _self_test():
             StubHandler.bounce_all = True
             try:
                 for mode in (["snapshot"], ["watch", "--dir", workdir]):
-                    code, seen = captured(lambda: main(
-                        mode + ["--url", "http://127.0.0.1:%d" % pp,
-                                "--token", "SECRETTOK"] + mode_args))
+                    code, seen = captured(lambda: tmain("SECRETTOK", mode + [
+                        "--url", "http://127.0.0.1:%d" % pp] + mode_args))
                     check(code == 2 and "leaves the verified host" in seen
                           and "SECRETTOK" not in seen and home.targets == [],
                           "%s with %s refuses a redirect to another host and "
@@ -2732,8 +2810,7 @@ def _self_test():
           "an opener built without a pin is unchanged")
 
     old_p, new_p = mirror_pair()
-    code, seen = run_mirror(old_p, new_p, ["--old-token", "OLDT",
-                                           "--new-token", "NEWT"])
+    code, seen = run_mirror(old_p, new_p, tokens=("OLDT", "NEWT"))
     check(code == 1, "a mirror run that found differences exits 1")
     check("old portal on host 127.0.0.2" in seen
           and "new portal on host 127.0.0.1" in seen,
@@ -2849,8 +2926,7 @@ def _self_test():
                            list(OLD_MIRROR["groups"].values()), org="OLDORG")
     quiet_new = FakePortal([r for r in clone_rows if "dup" not in r["id"]],
                            clone_groups, org="NEWORG")
-    code, seen = run_mirror(quiet_old, quiet_new, ["--old-token", "OLDT",
-                                                   "--new-token", "NEWT"])
+    code, seen = run_mirror(quiet_old, quiet_new, tokens=("OLDT", "NEWT"))
     check(code == 0 and "The new portal shares what the old one did." in seen,
           "two portals that share alike exit 0 and say so")
 
@@ -2900,7 +2976,7 @@ def _self_test():
           "--old-query changes the old side only")
 
     down_old, down_new = mirror_pair(fail_search_after=1)
-    code, seen = run_mirror(down_old, down_new, ["--new-token", "SECRETTOKEN"])
+    code, seen = run_mirror(down_old, down_new, tokens=(None, "SECRETTOKEN"))
     check(code == 2 and "SECRETTOKEN" not in seen,
           "a token that dies while reading the new portal exits 2 and prints "
           "no token")
@@ -3052,8 +3128,8 @@ def _self_test():
         with io.open(not_a_dir, "w", encoding="utf-8") as handle:
             handle.write("x")
         code, seen = captured(lambda: serving(
-            FakePortal(small, portal_groups), lambda: main(
-                ["snapshot", "--url", PORTAL, "--token", "T0KEN", "--out",
+            FakePortal(small, portal_groups), lambda: tmain("T0KEN",
+                ["snapshot", "--url", PORTAL, "--out",
                  not_a_dir, "--apply"])))
         check(code == 2 and "error:" in seen,
               "--out naming a file exits 2 with a message, not a traceback  "
@@ -3071,8 +3147,7 @@ def _self_test():
               "behind  <-- pinned defect")
 
         watch_dir = os.path.join(gap_dir, "w")
-        wargs = ["watch", "--url", PORTAL, "--dir", watch_dir, "--apply",
-                 "--token", "T0KEN"]
+        wargs = ["watch", "--url", PORTAL, "--dir", watch_dir, "--apply"]
         real_write = globals()["write_snapshot"]
 
         def full_disk(snapshot, directory, when):
@@ -3081,19 +3156,19 @@ def _self_test():
         globals()["write_snapshot"] = full_disk
         try:
             code, seen = captured(lambda: serving(
-                FakePortal(small, portal_groups), lambda: main(wargs)))
+                FakePortal(small, portal_groups), lambda: tmain("T0KEN", wargs)))
         finally:
             globals()["write_snapshot"] = real_write
         check(code == 2 and "disk full" in seen and "the baseline" in seen,
               "a baseline run that cannot write exits 2, not 0")
         captured(lambda: serving(FakePortal(small, portal_groups),
-                                 lambda: main(wargs)))
+                                 lambda: tmain("T0KEN", wargs)))
         globals()["write_snapshot"] = full_disk
         try:
             code, seen = captured(lambda: serving(
-                FakePortal(opened_up, portal_groups), lambda: main(wargs)))
+                FakePortal(opened_up, portal_groups), lambda: tmain("T0KEN", wargs)))
             quiet_code, quiet_seen = captured(lambda: serving(
-                FakePortal(small, portal_groups), lambda: main(wargs)))
+                FakePortal(small, portal_groups), lambda: tmain("T0KEN", wargs)))
         finally:
             globals()["write_snapshot"] = real_write
         check(code == 1 and "disk full" in seen and "item-public" in seen,
@@ -3108,16 +3183,18 @@ def _self_test():
         aargs = ["watch", "--url", PORTAL, "--dir", anon_dir, "--apply"]
         code, seen = captured(lambda: serving(
             FakePortal(small, portal_groups), lambda: main(aargs)))
-        check("WARNING: no token" in seen and code == 0,
-              "an anonymous read warns that it sees public items only")
+        check("WARNING: no token" in seen and code == 3,
+              "an anonymous read warns that it sees public items only and "
+              "exits 3, because a scheduler cannot trust it  "
+              "<-- pinned defect")
         code, seen = captured(lambda: serving(
             FakePortal(small, portal_groups), lambda: main(aargs)))
         check(code == 3 and "Cannot tell" in seen,
               "an anonymous watch run with no findings exits 3, not 0  "
               "<-- pinned defect")
         code, seen = captured(lambda: serving(
-            FakePortal(small, portal_groups), lambda: main(
-                ["snapshot", "--url", PORTAL, "--token", "T0KEN"])))
+            FakePortal(small, portal_groups), lambda: tmain(
+                "T0KEN", ["snapshot", "--url", PORTAL])))
         check("WARNING: no token" not in seen,
               "a read with a token does not warn about anonymity")
         with io.open(os.path.join(anon_dir, snapshots_in(anon_dir)[0]),
@@ -3133,10 +3210,13 @@ def _self_test():
     check(len(short_read[0]) == 5 and short_read[1] == 10 and short_read[2],
           "5 items read against a reported total of 10 is a short read, "
           "marked incomplete  <-- pinned defect")
-    code, seen = captured(lambda: serving(short_portal, lambda: main(
-        ["snapshot", "--url", PORTAL, "--token", "T0KEN"])))
+    code, seen = captured(lambda: serving(short_portal, lambda: tmain(
+        "T0KEN", ["snapshot", "--url", PORTAL])))
     check("5 were read" in seen and "ceiling" not in seen,
           "the run says the snapshot is short, and does not blame the ceiling")
+    check(code == 3,
+          "a snapshot run that read fewer items than the portal reported exits "
+          "3, not 0  <-- pinned defect")
     no_id = dict(catalog[0])
     del no_id["id"]
     nameless = serving(FakePortal([no_id], []), lambda: search_items(
@@ -3151,7 +3231,7 @@ def _self_test():
           "without carries it")
 
     # ---- the mirror says nothing is the same only when something was compared
-    toks = ["--old-token", "OLDT", "--new-token", "NEWT"]
+    toks = ("OLDT", "NEWT")
 
     def quiet_pair(**kw):
         return (FakePortal([r for r in rows_of(old_mirror_items)
@@ -3162,17 +3242,17 @@ def _self_test():
                            clone_groups, org="NEWORG", **kw))
 
     q_old, q_new = quiet_pair()
-    code, seen = run_mirror(q_old, q_new, toks)
+    code, seen = run_mirror(q_old, q_new, tokens=toks)
     check(code == 0, "the quiet pair is quiet when both reads are whole")
     lone = [dict(item("n-a", "o", "private", day1, title="A"), _groups=[])]
     code, seen = run_mirror(FakePortal([], [], org="OLDORG"),
-                            FakePortal(lone, [], org="NEWORG"), toks)
+                            FakePortal(lone, [], org="NEWORG"), tokens=toks)
     check(code == 3 and "the old portal returned no items" in seen
           and "shares what the old one did" not in seen,
           "an old portal that returned nothing is not a clean mirror: a "
           "mistyped query exits 3  <-- pinned defect")
     code, seen = run_mirror(FakePortal([], [], org="OLDORG"),
-                            FakePortal([], [], org="NEWORG"), toks)
+                            FakePortal([], [], org="NEWORG"), tokens=toks)
     check(code == 3 and "the old portal returned no items" in seen
           and "the new portal returned no items" in seen,
           "two empty portals are not a clean mirror  <-- pinned defect")
@@ -3180,7 +3260,7 @@ def _self_test():
     code, seen = run_mirror(
         FakePortal([dict(lone[0], title="Other")], [], org="OLDORG"),
         FakePortal([shown, dict(lone[0], title="Other")], [], org="NEWORG"),
-        toks)
+        tokens=toks)
     check(code == 1 and "mirror-new-shared" in seen
           and "shares what the old one did" not in seen,
           "an org item the old account cannot see is reported, not counted "
@@ -3198,16 +3278,16 @@ def _self_test():
           and "shares what the old one did" not in seen,
           "a mirror read without tokens sees public items only and cannot "
           "say the portals match  <-- pinned defect")
-    code, seen = run_mirror(*quiet_pair(), extra=["--old-token", "OLDT"])
+    code, seen = run_mirror(*quiet_pair(), tokens=("OLDT", None))
     check(code == 3 and "the new snapshot was read without a token" in seen,
           "one anonymous side is enough to make the verdict a gap")
     code, seen = run_mirror(*quiet_pair(reported_total=SEARCH_CEILING),
-                            extra=toks)
+                            tokens=toks)
     check(code == 3 and "Cannot tell" in seen and "WARNING" in seen
           and "shares what the old one did" not in seen,
           "two portals read to the ceiling are not a clean mirror  "
           "<-- pinned defect")
-    code, seen = run_mirror(*quiet_pair(reported_total=50), extra=toks)
+    code, seen = run_mirror(*quiet_pair(reported_total=50), tokens=toks)
     check(code == 3 and "holds 9 of the 50 item(s)" in seen,
           "a mirror side that paged short is not a clean mirror either  "
           "<-- pinned defect")
@@ -3251,9 +3331,20 @@ def _self_test():
           and mirror_groups_of([group("o-g", "org", title="Staff")],
                                [group("n-g", "org", title="Staff")]) == []
           and mirror_groups_of([group("o-g", "org", title="Old")],
-                               [group("n-g", "public", title="New")]) == [],
-          "an unchanged group, a narrowed membershipAccess and a group with "
-          "no twin are not reported")
+                               [group("n-g", "private", title="New")]) == [],
+          "an unchanged group, a narrowed membershipAccess and a private group "
+          "with no twin are not reported")
+    new_only_public = mirror_groups_of(
+        [], [group("n-g", "public", title="Staging")],
+        [item("n-i", "o", "private", day1, groups=["n-g"])])
+    check([ev.kind for ev in new_only_public] == ["mirror-new-public"]
+          and new_only_public[0].item_count == 1
+          and "only on the new portal" in new_only_public[0].detail,
+          "a public group that exists only on the new portal is reported with "
+          "the items inside it  <-- pinned defect")
+    new_only_org = mirror_groups_of([], [group("n-g", "org", title="Staging")])
+    check([ev.kind for ev in new_only_org] == ["mirror-new-shared"],
+          "an org group that exists only on the new portal is reported too")
     dup_old = mirror_groups_of([group("o-1", "private", title="Staff"),
                                 group("o-2", "private", title="Staff")],
                                [group("n-g", "public", title="Staff")],
@@ -3275,14 +3366,14 @@ def _self_test():
     g_old, g_new = mirror_pair()
     g_new.groups = [dict(g, access="public") if g["id"] == "n-g1" else g
                     for g in g_new.groups]
-    code, seen = run_mirror(g_old, g_new, toks)
+    code, seen = run_mirror(g_old, g_new, tokens=toks)
     check("group access old org, new public" in seen
           and "(2 item(s) inside)" in seen,
           "a public group on the new portal is reported in a real mirror run")
     q_old, q_new = quiet_pair()
     q_new.groups = [dict(g, access="public") if g["title"] == "Public Works"
                     else g for g in q_new.groups]
-    code, seen = run_mirror(q_old, q_new, toks)
+    code, seen = run_mirror(q_old, q_new, tokens=toks)
     check(code == 1 and "shares what the old one did" not in seen,
           "a portal whose only difference is a public group is not clean  "
           "<-- pinned defect")
@@ -3427,20 +3518,20 @@ def _self_test():
     said = fails(lambda: serving(Canned({"error": "denied"}), lambda: _call(
         PORTAL, "search", {})), "an error that is a bare string is raised")
     check(said.endswith("denied"), "the bare error text reaches the operator")
-    code, seen = captured(lambda: serving(Canned([]), lambda: main(
-        ["snapshot", "--url", PORTAL, "--token", "T0KEN"])))
+    code, seen = captured(lambda: serving(Canned([]), lambda: tmain(
+        "T0KEN", ["snapshot", "--url", PORTAL])))
     check(code == 2 and "error:" in seen,
           "a portal answering a JSON list exits 2, not with a traceback  "
           "<-- pinned defect")
     code, seen = captured(lambda: serving(
-        Canned({"total": 1, "results": "x"}), lambda: main(
-            ["snapshot", "--url", PORTAL, "--token", "T0KEN", "--query", "q"])))
+        Canned({"total": 1, "results": "x"}), lambda: tmain("T0KEN",
+            ["snapshot", "--url", PORTAL, "--query", "q"])))
     check(code == 2 and "unexpected AttributeError" in seen,
           "any other surprise ends as exit 2 with a message, because exit 1 "
           "means findings  <-- pinned defect")
     code, seen = captured(lambda: serving(
-        Canned(raising=KeyboardInterrupt()), lambda: main(
-            ["snapshot", "--url", PORTAL, "--token", "T0KEN"])))
+        Canned(raising=KeyboardInterrupt()), lambda: tmain("T0KEN",
+            ["snapshot", "--url", PORTAL])))
     check(code == 130 and "interrupted" in seen and "Traceback" not in seen,
           "Ctrl+C ends with one line and exit 130")
 
@@ -3467,10 +3558,7 @@ def _self_test():
     with env_set(TOKEN_ENV, "ENVTOKEN"):
         check(_authenticate(_parse(["snapshot", "--url", PORTAL]))
               == "ENVTOKEN",
-              "a token is read from %s when there is no flag" % TOKEN_ENV)
-        check(_authenticate(_parse(["snapshot", "--url", PORTAL, "--token",
-                                    "FLAGTOKEN"])) == "FLAGTOKEN",
-              "a --token flag wins over the environment")
+              "a token is read from %s" % TOKEN_ENV)
     check(TOKEN_ENV not in os.environ,
           "the borrowed token variable is removed again")
     with env_set(TOKEN_ENV_OLD, "OLDENV"), env_set(TOKEN_ENV_NEW, "NEWENV"):
@@ -3531,15 +3619,96 @@ def _self_test():
                                     "access": "public",
                                     "membershipAccess": None}])
     check(serving(public_group, lambda: search_groups(
-        PORTAL, "orgid:ORG123", "TESTTOKEN"))["gp"]["access"] == "public",
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))[0]["gp"]["access"] == "public",
         "a group's access is read from the portal, not forced to private  "
         "<-- pinned defect")
     many_groups = FakePortal([], [{"id": "g%03d" % n, "title": "G", "owner": "o",
                                    "access": "org", "membershipAccess": None}
                                   for n in range(150)])
     check(len(serving(many_groups, lambda: search_groups(
-        PORTAL, "orgid:ORG123", "TESTTOKEN"))) == 150,
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))[0]) == 150,
         "150 groups are read across two pages  <-- pinned defect")
+    # ---- a group read that came back short is a gap, not a lost membership
+    in_g = [dict(r, _groups=["g-works"]) for r in catalog[:3]]
+    whole_snap = serving(FakePortal(in_g, portal_groups), lambda: take_snapshot(
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    check("groups_short" not in whole_snap,
+          "a snapshot whose groups were read whole carries no groups_short key")
+    short_members = serving(
+        FakePortal(in_g, portal_groups, members_total=9),
+        lambda: take_snapshot(PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    check(short_members["groups_short"] is True
+          and short_members["truncated"] is False,
+          "a group member search cut short marks the snapshot, and not as an "
+          "item short read  <-- pinned defect")
+    short_listing = serving(
+        FakePortal(in_g, portal_groups, groups_total=4),
+        lambda: take_snapshot(PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    check(short_listing["groups_short"] is True,
+          "a group listing cut short marks the snapshot too")
+    check(any("group memberships are incomplete" in g
+              for g in coverage_gaps(whole_snap, short_members))
+          and any("read a group listing or a group's members short" in line
+                  for line in truncation_warning(whole_snap, short_members)),
+          "a diff against a snapshot with short groups says it cannot tell  "
+          "<-- pinned defect")
+    code, seen = captured(lambda: serving(
+        FakePortal(in_g, portal_groups, members_total=9),
+        lambda: tmain("T0KEN", ["snapshot", "--url", PORTAL])))
+    check(code == 3 and "came back short" in seen,
+          "a snapshot run with short group reads exits 3 and says why")
+
+    # ---- the pins for controls that no other assertion could fail
+    check(item_record({"id": "a", "type": "Web Map"})["type"] == "Web Map",
+          "an item keeps its type through the record  <-- pinned defect")
+    same_title = [dict(catalog[0], id="fs", title="Roads", _groups=[]),
+                  dict(catalog[1], id="wm", title="Roads", type="Web Map",
+                       _groups=[])]
+    both = serving(FakePortal(same_title, []), lambda: take_snapshot(
+        PORTAL, "orgid:ORG123", "TESTTOKEN"))
+    _events, pair_stats = mirror_diff(both, both)
+    check(pair_stats["paired"] == 2 and pair_stats["ambiguous"] == 0,
+          "a feature service and a web map that share a title are two pairs, "
+          "not one ambiguous title  <-- pinned defect")
+    check(redact("498 None", None) == "498 None"
+          and redact("abc", "") == "abc"
+          and redact("a token=abc", "abc") == "a token=" + REDACTED,
+          "an empty or missing secret redacts nothing, a real one does  "
+          "<-- pinned defect")
+    nameless_groups = FakePortal([], portal_groups)
+    serving(nameless_groups, lambda: search_groups(PORTAL, "orgid:ORG123", None))
+    check(not any("token=" in t for t in nameless_groups.targets),
+          "an anonymous group search sends no token parameter  "
+          "<-- pinned defect")
+
+    # ---- a mistyped flag is echoed by name only, never with its value
+    noise, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        try:
+            _parse(["mirror", "--tokn=SECRETVALUE", "--other", "x"])
+        except SystemExit as exc:
+            leaked = sys.stderr.getvalue()
+            check(exc.code == 64 and "--tokn" in leaked
+                  and "SECRETVALUE" not in leaked,
+                  "an unrecognised --flag=value is refused by name without its "
+                  "value  <-- pinned defect")
+    finally:
+        sys.stderr = noise
+
+    # ---- a private item shared to a group is not an org-wide exposure
+    before_shared = build_snapshot("u", "t", {"a": item("a", "o", "private",
+                                                        day1)}, {}, 1, False)
+    after_shared = build_snapshot("u", "t", {"a": item("a", "o", "shared", day1,
+                                                       groups=["g"])}, {}, 1,
+                                  False)
+    shared_events = diff_snapshots(before_shared, after_shared)
+    check(sorted(ev.kind for ev in shared_events)
+          == ["item-joined-group", "item-shared"]
+          and SEVERITY["item-shared"] < SEVERITY["item-joined-group"]
+          and SEVERITY["item-shared"] < SEVERITY["item-org"],
+          "private to group-only is item-shared, below item-org  "
+          "<-- pinned defect")
+
     real_self_test = globals()["self_test"]
     globals()["self_test"] = lambda: 7
     try:
@@ -3625,8 +3794,9 @@ def _parse(argv):
         allow_abbrev=False,
         description="Diff an ArcGIS organization's sharing posture against "
                     "yesterday, because the platform keeps no audit log.",
-        epilog="Read-only. There is no flag that changes sharing. The password "
-               "is never a flag: export %s or answer the prompt." % SECRET_ENV,
+        epilog="Read-only. There is no flag that changes sharing. A password or "
+               "token is never a flag: export %s or %s, or answer the prompt."
+               % (SECRET_ENV, TOKEN_ENV),
     )
     ap.add_argument("mode", nargs="?", choices=["snapshot", "diff", "watch", "mirror"],
                     help="snapshot writes one, diff compares two, watch takes a "
@@ -3634,12 +3804,9 @@ def _parse(argv):
                          "mirror compares two portals and writes nothing")
     ap.add_argument("paths", nargs="*", default=[],
                     help="for diff: the older snapshot then the newer one")
-    ap.add_argument("--url", help="portal url, e.g. https://county.maps.arcgis.com")
+    ap.add_argument("--url", help="portal url, e.g. https://example.maps.arcgis.com")
     ap.add_argument("--query",
                     help="search query (default: orgid of the signed-in org)")
-    ap.add_argument("--token",
-                    help="an existing portal token. A flag is readable in argv "
-                         "and shell history, so prefer %s." % TOKEN_ENV)
     ap.add_argument("--username",
                     help="generate a token for this user. The password comes "
                          "from %s or an unechoed prompt, never from argv."
@@ -3653,12 +3820,6 @@ def _parse(argv):
                          "The run is refused if --new-url is another host, if "
                          "--old-url is this host, if the new portal declares a "
                          "different host, or if a redirect leaves the host.")
-    ap.add_argument("--old-token", dest="old_token",
-                    help="mirror: an existing token for the old portal (or "
-                         "%s)" % TOKEN_ENV_OLD)
-    ap.add_argument("--new-token", dest="new_token",
-                    help="mirror: an existing token for the new portal (or "
-                         "%s)" % TOKEN_ENV_NEW)
     ap.add_argument("--old-username", dest="old_username",
                     help="mirror: generate a token on the old portal. The "
                          "password comes from %s or a prompt." % SECRET_ENV_OLD)
@@ -3689,17 +3850,23 @@ def _parse(argv):
                          "and reported on, and nothing is written.")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
-    return ap.parse_args(argv)
+    args, extra = ap.parse_known_args(argv)
+    if extra:
+        # argparse echoes an unknown argument whole, and a mistyped
+        # --flag=value carries its value into the error. Only the name is shown.
+        ap.error("unrecognized arguments: %s"
+                 % " ".join(arg.split("=", 1)[0] for arg in extra))
+    return args
 
 
-def _sign_in(url, token, username, insecure, env=SECRET_ENV, pin_host=None,
+def _sign_in(url, username, insecure, env=SECRET_ENV, pin_host=None,
              token_env=TOKEN_ENV):
     """Return a token, or None for an anonymous read.
 
-    A token comes from the flag, else from the environment variable, so that it
-    need not sit in argv.
+    A token comes from the environment variable and never from argv, where
+    every process on the box could read it.
     """
-    token = token or os.environ.get(token_env)
+    token = os.environ.get(token_env)
     if token:
         return token
     if not username:
@@ -3710,7 +3877,7 @@ def _sign_in(url, token, username, insecure, env=SECRET_ENV, pin_host=None,
 
 def _authenticate(args):
     """Return a token, or None for an anonymous read."""
-    return _sign_in(args.url, args.token, args.username, args.insecure,
+    return _sign_in(args.url, args.username, args.insecure,
                     pin_host=host_of(args.url))
 
 
@@ -3721,20 +3888,27 @@ def _snapshot(args):
     # and record that host's answer as this portal's snapshot.
     pin = host_of(args.url)
     query = args.query
-    if not query:
-        oid = org_id(args.url, token, args.insecure, pin)
-        if not oid:
-            raise RuntimeError("could not read the org id, pass --query")
-        query = "orgid:%s" % oid
-    return _read(args.url, token, query, args.insecure, pin)
+    oid = org_id(args.url, token, args.insecure, pin)
+    if not oid and not query:
+        raise RuntimeError("could not read the org id, pass --query")
+    return _read(args.url, token, query or "orgid:%s" % oid, args.insecure, pin,
+                 oid)
 
 
-def _read(url, token, query, insecure, pin_host=None):
-    """Read one org into a snapshot and print what it covers."""
+def _read(url, token, query, insecure, pin_host=None, oid=None):
+    """Read one org into a snapshot and print what it covers.
+
+    Groups are always searched by the org id when it is known: --query is an
+    item query and the group search has other fields.
+    """
     print("reading %s" % url)
     print("query: %s" % query)
+    if not oid:
+        print("WARNING: the org id could not be read, so groups are searched "
+              "with the same query as items.")
     snapshot = take_snapshot(url, query, token, insecure,
-                             echo=lambda line: print(line), pin_host=pin_host)
+                             echo=lambda line: print(line), pin_host=pin_host,
+                             group_query="orgid:%s" % oid if oid else None)
     print("%d item(s), %d group(s), reported total %d"
           % (len(snapshot["items"]), len(snapshot["groups"]),
              snapshot["reported_total"]))
@@ -3753,20 +3927,26 @@ def _read(url, token, query, insecure, pin_host=None):
               "this snapshot is incomplete."
               % (snapshot["reported_total"], len(snapshot["items"])))
         print("Paging a live portal is not atomic. Run it again.")
+    if snapshot.get("groups_short"):
+        print("")
+        print("WARNING: a group listing or a group's members came back short, "
+              "so some group memberships are missing from this snapshot. Run "
+              "it again.")
     return snapshot
 
 
-def _empty_read(snapshot):
-    """Exit code of a snapshot or baseline run: 3 when it holds no items.
+def _read_exit(snapshot):
+    """Exit code of a snapshot or baseline run: 3 when the read proves little.
 
     A mistyped query or an account that sees nothing reads as an empty org, and
-    every later diff of two empty reads would be "no changes".
+    every later diff of two empty reads would be "no changes". A read cut short
+    or made without a token is the same kind of gap, and a scheduler that alerts
+    on non-zero must hear about it.
     """
-    if snapshot["items"]:
-        return 0
-    print("\nWARNING: the read returned no items, so it proves nothing. Check "
-          "--query and the account.")
-    return 3
+    if not snapshot["items"]:
+        print("\nWARNING: the read returned no items, so it proves nothing. "
+              "Check --query and the account.")
+    return 3 if snapshot_gaps(snapshot, "this") else 0
 
 
 def _write(snapshot, directory, apply_it):
@@ -3830,9 +4010,8 @@ def _open_side(args, side, verify):
     url = getattr(args, side + "_url")
     pin = host_of(url)
     env = SECRET_ENV_OLD if side == "old" else SECRET_ENV_NEW
-    token = _sign_in(url, getattr(args, side + "_token"),
-                     getattr(args, side + "_username"), args.insecure, env, pin,
-                     TOKEN_ENV_OLD if side == "old" else TOKEN_ENV_NEW)
+    token = _sign_in(url, getattr(args, side + "_username"), args.insecure, env,
+                     pin, TOKEN_ENV_OLD if side == "old" else TOKEN_ENV_NEW)
     described = portal_self(url, token, args.insecure, pin)
     declared = declared_hosts(described)
     if side == "new" and verify not in declared:
@@ -3849,13 +4028,12 @@ def _read_side(args, side, opened):
     """Read one proved portal into a snapshot. Each side is pinned to its host."""
     url, token, pin, described = opened
     query = getattr(args, side + "_query")
-    if not query:
-        if not described.get("id"):
-            raise RuntimeError("could not read the org id of the %s portal, "
-                               "pass --%s-query" % (side, side))
-        query = "orgid:%s" % described["id"]
+    oid = described.get("id")
+    if not query and not oid:
+        raise RuntimeError("could not read the org id of the %s portal, "
+                           "pass --%s-query" % (side, side))
     print("\n%s portal on host %s" % (side, pin))
-    return _read(url, token, query, args.insecure, pin)
+    return _read(url, token, query or "orgid:%s" % oid, args.insecure, pin, oid)
 
 
 def _mirror(args):
@@ -3989,7 +4167,7 @@ def _run(args):
         except (RuntimeError, OSError) as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
-        return _empty_read(snapshot)
+        return _read_exit(snapshot)
 
     # watch: a fresh snapshot against the newest file already in --dir
     if not args.dir:
@@ -4040,7 +4218,7 @@ def _run(args):
                   "to write the baseline." % args.dir)
             return 3
         print("\nNo earlier snapshot in %s. This one is the baseline." % args.dir)
-        return 2 if write_failed else _empty_read(snapshot)
+        return 2 if write_failed else _read_exit(snapshot)
     print("\nbaseline: %s" % previous)
     code = _report(baseline, snapshot, args.window_minutes)
     return 2 if write_failed and code != 1 else code
