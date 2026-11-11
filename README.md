@@ -29,7 +29,7 @@ and nothing else: not when it changed, not who changed it, not what else moved w
 item's modified date is the only trace, and the next edit overwrites it. So the honest answer to
 "how long was it exposed, and what else went with it" is that nobody knows.
 
-The block below is an excerpt of a real run. A line that reads `...` stands for lines left out, and the last line is the real count.
+The block below is an excerpt of a real run, in run order. A line that reads `...` stands for lines left out, and the last line is the real count.
 
 ```
 $ python sharewatch.py --self-test
@@ -40,84 +40,137 @@ PASS  public is the widest level
 PASS  group-only sharing is narrower than org-wide
 ...
 PASS  a page that came back short advances by the ten rows it got, not by the hundred it asked for  <-- pinned defect
+...
 PASS  an org whose last page ends one row short of the total is paged to that last row, not stopped one item early  <-- pinned defect
+...
 PASS  the row sitting exactly on the ceiling is still asked for  <-- pinned defect
+...
 PASS  exactly 10,000 cannot be proven complete  <-- pinned defect
+...
 PASS  the warning says the deletions below may not be real  <-- pinned defect
 ...
 PASS  a url with no scheme is refused, because urllib quotes the whole url back into its error and that url carries the token  <-- pinned defect
 ...
+PASS  a url with a token in the fragment is refused, because the error urllib raises quotes it back and redact() cannot know it  <-- pinned defect
+...
 PASS  nine bulk items and one unrelated item are two events, not ten
 PASS  one owner's bulk share collapses to a single event
+...
 PASS  at equal severity the event touching nine items leads the one touching one, even when the owner names sort the other way  <-- pinned defect
 ...
 PASS  a group created public is reported, not only one flipped public  <-- pinned defect
-PASS  private to group-only is item-shared, below item-org  <-- pinned defect
+...
 PASS  items missing from the new snapshot are DELETED  <-- pinned defect
+...
 PASS  60 deletions by one owner are one event, however old the items were  <-- pinned defect
+...
 PASS  a bulk add to one group is one event, because a group share does not bump modified  <-- pinned defect
 PASS  an item only in the new snapshot is NEW  <-- pinned defect
 PASS  a day where everything was deleted is not a clean day  <-- pinned defect
 ...
 PASS  a windows console gets a replaced character, not a crash that loses every finding below it  <-- pinned defect
 ...
+PASS  a token is not a flag, because argv is readable by every process  <-- pinned defect
+...
 PASS  a unique prefix of --apply is refused, so the write flag is never reached by abbreviation  <-- pinned defect
-PASS  a scheme-less --url is refused before any request is built  <-- pinned defect
 PASS  a credential typed into --url is refused before any request and never echoed  <-- pinned defect
+...
+PASS  a scheme-less --url is refused before any request is built  <-- pinned defect
+...
 PASS  items as a JSON list is refused, because the diff indexes items by id and would raise TypeError instead  <-- pinned defect
+...
 PASS  paging reads all 250 items, not the 100 the server caps a page at  <-- pinned defect
+...
 PASS  the portal's modified date is carried into the record, not zeroed  <-- pinned defect
 PASS  four items the portal dated ten hours apart stay four events, because the date reached the collapse  <-- pinned defect
+...
 PASS  every call asks for f=json, or the portal answers with the html page and json.loads gets a doctype  <-- pinned defect
 PASS  a server that quietly gives back ten rows for a page of a hundred is still paged to the end of the org  <-- pinned defect
+...
 PASS  an item in two groups gets them back in id order, so an unchanged org writes the same bytes twice  <-- pinned defect
+...
 PASS  the token never reaches the snapshot document  <-- pinned defect
+...
 PASS  the password never appears in a url  <-- pinned defect
+...
 PASS  --username signs in and returns a token  <-- pinned defect
+...
 PASS  a token in the url urllib quoted back is redacted out of the error  <-- pinned defect
+...
 PASS  a token that dies mid-paging fails the snapshot  <-- pinned defect
+...
 PASS  the default opener verifies the certificate  <-- pinned defect
 ...
 PASS  a dry run leaves the directory empty  <-- pinned defect
 PASS  the token never reaches stdout  <-- pinned defect
+...
 PASS  no credential reaches the snapshot file on disk  <-- pinned defect
+...
+PASS  groups are searched by the org id even with an item --query, because the group search has other fields  <-- pinned defect
+...
 PASS  a token that died mid-paging writes no half-read snapshot and does not overwrite the one that finished  <-- pinned defect
+...
+PASS  the first watch run has nothing to compare with, says so and exits 3, never 0  <-- pinned defect
+...
+PASS  watch read by a publisher cannot call a day quiet: it exits 3  <-- pinned defect
+...
 PASS  watch diffs against the snapshot that was in --dir before the run, not against the file it just wrote over it  <-- pinned defect
+...
 PASS  the org that was just read is still written when yesterday's file turns out to be corrupt  <-- pinned defect
+...
 PASS  a sharing level this version has never heard of is refused, not sorted as private and called safe  <-- pinned defect
+...
 PASS  an item title a cp1252 console cannot encode is replaced, and the finding still prints  <-- pinned defect
+...
 PASS  --insecure with --username is refused, because that posts the password down an unverified connection  <-- pinned defect
 ...
+PASS  a refused --verify-host is not echoed, a token may sit in it  <-- pinned defect
 PASS  a --new-url on another host than --verify-host is refused  <-- pinned defect
 PASS  an --old-url on the verified host is refused, or the run compares the new portal with itself  <-- pinned defect
+...
 PASS  two items made public by one owner are one event even when their dates are a week apart  <-- pinned defect
+...
 PASS  a 200 that names groups in notSharedWith is a finding, not a success  <-- pinned defect
+...
 PASS  a prefix of --apply is refused on the mirror mode too  <-- pinned defect
-PASS  a token is not a flag, because argv is readable by every process  <-- pinned defect
-PASS  an unrecognised --flag=value is refused by name without its value  <-- pinned defect
-PASS  a public group that exists only on the new portal is reported with the items inside it  <-- pinned defect
-PASS  a group member search cut short marks the snapshot, and not as an item short read  <-- pinned defect
-PASS  a snapshot run that read fewer items than the portal reported exits 3, not 0  <-- pinned defect
-PASS  groups are searched by the org id even with an item --query, because the group search has other fields  <-- pinned defect
+...
 PASS  a pinned call refuses a redirect to another host  <-- pinned defect
+...
 PASS  a token for one portal is never sent to the other  <-- pinned defect
+...
+PASS  mirror read by a publisher cannot call two portals alike: it exits 3 and says whose view is partial  <-- pinned defect
+...
 PASS  a host refusal is made before any request is sent  <-- pinned defect
 PASS  a new url that answers but declares another host is refused, so a DNS alias left on the old portal is caught  <-- pinned defect
 ...
+PASS  a snapshot run that read fewer items than the portal reported exits 3, not 0  <-- pinned defect
+...
+PASS  a public group that exists only on the new portal is reported with the items inside it  <-- pinned defect
+...
+PASS  a group member search cut short marks the snapshot, and not as an item short read  <-- pinned defect
+...
+PASS  an unrecognised --flag=value is refused by name without its value  <-- pinned defect
+...
+PASS  a secret typed after the two paths diff takes is refused without being echoed  <-- pinned defect
+...
+PASS  a secret typed as the value of --window-minutes is refused without being echoed  <-- pinned defect
+...
+PASS  private to group-only is item-shared, below item-org  <-- pinned defect
+...
 PASS  Query added and an anonymous count that works is the flip, open
+...
 PASS  a layer that does not list Query and answers an anonymous count is reported, because the answer is the exposure  <-- pinned defect
-PASS  a count the server failed to answer is exit 3, not a clean 0  <-- pinned defect
-PASS  mirror read by a publisher cannot call two portals alike: it exits 3 and says whose view is partial  <-- pinned defect
-PASS  watch read by a publisher cannot call a day quiet: it exits 3  <-- pinned defect
-PASS  the first watch run has nothing to compare with, says so and exits 3, never 0  <-- pinned defect
+...
 PASS  the capabilities are read with the token and the count is asked with no token at all  <-- pinned defect
+...
+PASS  a count the server failed to answer is exit 3, not a clean 0  <-- pinned defect
 ...
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted and two failed portal calls as six failures, so a broken tool turns this self-test red  <-- pinned defect
 ...
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
---------------------------------------------------------------------
-590 assertions, 0 failed
+...
+600 assertions, 0 failed
 ```
 
 ## Requirements
@@ -125,7 +178,7 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 590 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 600 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
 there. Python 3.9 is checked by hand, by parsing the file for 3.9 syntax. That check is not in the
 repository or the self-test, and the file was never run on 3.9.
@@ -195,8 +248,7 @@ urllib repeats the request in some of its exceptions.
 
 The token gets the same treatment and has no flag either. Export `SHAREWATCH_TOKEN`, or for
 `mirror` `SHAREWATCH_OLD_TOKEN` and `SHAREWATCH_NEW_TOKEN`. An earlier version took `--token`,
-and a token in `argv` is readable by every process on the machine. A mistyped flag is echoed by
-name only, so a `--tokn=VALUE` typo does not print its value. A bad mode is refused without printing the word, so the old
+and a token in `argv` is readable by every process on the machine. A usage error shows long flag names only, so a `--tokn=VALUE` typo does not print its value, and a word that follows an unknown flag is counted and not printed. The values of `--apply=VALUE`, `--window-minutes VALUE` and `--verify-host` are not echoed either. A bad mode is refused without printing the word, so the old
 `--token VALUE` form is never echoed. Getting the error text right took
 two goes. A token is sent as a query
 parameter, and urllib answers a url it cannot open by quoting the whole url back inside the
@@ -211,9 +263,9 @@ Exit codes:
 |---|---|
 | 0 | No differences, and the read was whole. |
 | 1 | Anything to read. A narrowing or a deletion is a difference too, so 1 does not mean "something widened". |
-| 2 | The portal or service call failed, a mirror host proof failed, or the tool hit an error it does not know. |
-| 3 | No differences found, but the read cannot prove it: it held no items, was cut short, was made without a token, was made by an account that is not an organization administrator, or left group memberships unread. A `watch` run with no earlier snapshot in `--dir` also exits 3, with or without `--apply`, because it compared nothing. For `caps`: a layer that lists no capabilities, or an anonymous count that gave no usable answer, with no flip found. |
-| 64 | Usage error, a corrupt baseline file, or a sharing level this version does not know. |
+| 2 | The portal or service call failed, a mirror run's declared-host or redirect proof failed, a password was not supplied, or the tool hit an error it does not know. |
+| 3 | No differences found, but the read cannot prove it: it held no items, was cut short, was made without a token (not for `caps`, see Limits), was made by an account that is not an organization administrator, or left group memberships unread. A `watch` run with no earlier snapshot in `--dir` also exits 3, with or without `--apply`, because it compared nothing. For `caps`: a layer that lists no capabilities, or an anonymous count that gave no usable answer, with no flip found. |
+| 64 | Usage error (a `--verify-host` that disagrees with `--new-url` or `--old-url` is one), a corrupt baseline file, or a sharing level this version does not know. |
 
 A scheduler that alerts only on 1 and 2 treats 3 as success. Alert on any non-zero code.
 
@@ -562,7 +614,7 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows (2299 statements, 504 branches), measured with `coverage run --branch`. The Linux host
+- Coverage is 100 percent branch on Windows (2421 statements, 538 branches), measured with `coverage run --branch`. The Linux host
   has no `coverage` module installed, so the Linux run reports the assertion count only.
 
 More limits, each one a sentence:
@@ -588,7 +640,7 @@ More limits, each one a sentence:
 - A `--responses` entry whose `itemId` is a JSON list raises `TypeError` and ends as exit 2 with `unexpected TypeError`.
 - `watch` picks its baseline by file name only. A file named `sharewatch-` plus anything, or a snapshot of another portal in the same `--dir`, can become the baseline.
 - A snapshot is written non-atomically. A full disk can leave a truncated newest file, and the next `watch` run stops with exit 64 on it.
-- A `--url`, `--old-url`, `--new-url` or `--service-url` that carries `user:password@`, or `token`, `access_token` or `password` in its query string, is refused with exit 64 and is never printed back. Another secret in a query string, such as an API key under a name this check does not know, is still printed in an error.
+- A `--url`, `--old-url`, `--new-url` or `--service-url` that carries `user:password@`, or `token`, `access_token` or `password` in its query string or its fragment, is refused with exit 64 and is never printed back. Another secret in a query string, such as an API key under a name this check does not know, is still printed in an error.
 - The stored `url` of a snapshot is whatever `--url` held, so it can hold a query string if you typed one.
 - A `--username` sign-in over an `http://` url sends the password in clear text. Use `https://`.
 - The redirect pin compares host names only, so a redirect from https to http, or to another port on the same host, is followed.
@@ -630,13 +682,26 @@ More limits, each one a sentence:
 - `.gitignore` does not exclude `sharewatch-*.json`. A snapshot holds item titles, owners and sharing levels for the whole org, so keep `--out` outside any repository.
 - A snapshot taken with a token that is not an administrator's holds only the items and groups that account can see. `snapshot`, `watch` and `mirror` read `user.role` from `portals/self` and mark such a snapshot `"limited": true`, so the run exits 3 and a later `diff` of that file says so. Only the role `org_admin` counts as an administrator. A custom role with administrator privileges, and a portal that does not describe the user, are treated as limited, so those runs exit 3 although the read was whole.
 - A snapshot taken before this check carries no `limited` key, so a `diff` of an old file from a non-administrator still reads as whole.
-- A value that follows an unknown flag is printed in the usage error when the mode already holds two positional paths, as `diff` does. `diff a.json b.json --token SECRET` prints `unrecognized arguments: --token SECRET`. The other modes print only the flag.
+- A usage error prints only the long flag names, and counts any other word it does not show. A one-letter flag is counted like any other word.
 - The Mirror and Caps sample blocks come from stub runs that are not shipped. The Caps block was re-run against an independent `http.server` stub and gave the same output with exit 1, but that stub is not in the repository either.
 - The counts of changes in the mutation runs come from a harness that is not in this repository. Treat them as the author's report and not as something you can run.
 - The self-test pins HTTP 400, 404, 407, 408, 429 and 503, and body codes 400, 404, 407, 408, 429 and 500, as unknown. It pins no other status.
 - The Limits section is long. The limits that change an exit code are the ones about exit 3, an administrator token, the search ceiling and the host pin.
 - The sharing-change example near the Mirror section, with `item-public`, `group-public` and `item-deleted`, is illustrative and not a captured run. The count of 30 requests against 4,000 in the paging section is an estimate.
 - A search for `sharemirror` on GitHub on 2026-10-29 and again on 2026-11-10 found the same two unrelated repositories. That says what the search found, not that no tool does a two-portal comparison.
+- The self-test excerpt near the top keeps real lines in run order and leaves most out. A line that reads `...` marks the gap.
+- For `caps`, a run with no token exits 0 when the result is clean and only prints a warning. The capabilities are then what a stranger is shown.
+- A clean Create-only view may exit 3 until the real refusal code Esri sends a stranger is known, because only HTTP 401 and 403 and body codes 401, 403, 498 and 499 count as closed.
+- `caps` sends the token as a query parameter on every GET, including to a plain `http://` `--service-url`. Use `https://` there, because the token travels in the query string.
+- `--was` is a comma-separated list of exact capability names, such as `Create,Query`. A misspelt name or a space-separated list gives a false `cap-flip` and `cap-added`, exit 1.
+- A body error code is matched only as an integer. A string code such as `"403"` counts as unknown, so the run exits 3 or reports the flip as inconclusive. That fails safe.
+- A missing password exits 2, the same as a portal failure, though it is a configuration error.
+- A `--query` or `--url` holding characters the console code page cannot encode, such as Greek on cp1252, stops with `unexpected UnicodeEncodeError` and exit 2 after some output.
+- `--service-url` with a query string, such as `.../FeatureServer?foo=bar`, builds a malformed layer url because `/0` is appended after the query. Any key other than `token`, `access_token` and `password` is echoed in errors.
+- The redirect pin compares host names only. A same-host redirect from `https` to `http`, or to another port, is followed and carries the token in clear text.
+- Item titles, owners, group names and messages in a `--responses` file are printed raw, so a member of the organization can forge a line that looks like a finding. The exit code is not affected.
+- Snapshot writes are not atomic, and two `--apply` runs in the same second overwrite each other.
+- The 20-mutation spot check of `caps` and the macOS statement that the stub server binds only `127.0.0.1` by default are not exercised by anything in this repository.
 - Portal error messages are printed to standard error as the portal returns them, control characters included, as item titles are.
 - `redact()` matches the raw, `quote_plus` and `quote` forms of a secret only. A server that echoes a token in another encoding, such as HTML entities, is not redacted.
 

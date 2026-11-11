@@ -251,8 +251,10 @@ def is_http_url(url):
         return False
     if "@" in parts.netloc:
         return False
+    # An OAuth redirect puts the token in the fragment, as #access_token=.
     keys = set(key.lower() for key, _v in
-               urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+               urllib.parse.parse_qsl(parts.query + "&" + parts.fragment,
+                                      keep_blank_values=True))
     return not keys.intersection(URL_SECRET_KEYS)
 
 
@@ -736,8 +738,9 @@ def check_hosts(old_url, new_url, verify_host):
     """
     host = (verify_host or "").strip().lower()
     if not host or "/" in host or ":" in host:
+        # The value is not echoed: a token pasted here would reach the log.
         raise ValueError("--verify-host takes a bare host name such as "
-                         "gis.example.org, got %r" % (verify_host,))
+                         "gis.example.org, with no scheme, path or port")
     if host_of(new_url) != host:
         raise ValueError("--new-url is on host %r, not the verified host %r"
                          % (host_of(new_url), host))
@@ -1654,6 +1657,8 @@ def _self_test():
             ("https://example.org/svc?token=TOKSECRET", "a token in the query"),
             ("https://example.org/svc?f=json&Access_Token=X", "access_token"),
             ("https://example.org/svc?password=X", "a password in the query"),
+            ("https://example.org/svc#access_token=X", "a token in the fragment"),
+            ("https://example.org/svc?f=json#token=X", "a fragment after a query"),
             ("https://[::1/svc", "a url urllib cannot parse")):
         check(is_http_url(url) is False,
               "a url with %s is refused, because the error urllib raises "
@@ -2858,6 +2863,15 @@ def _self_test():
         raises(lambda: check_hosts("https://old.example.org",
                                    "https://new.example.org", bad),
                "%s --verify-host is refused, it takes a bare host name" % why)
+    refusals = []
+    try:
+        check_hosts("https://old.example.org", "https://new.example.org",
+                    "https://new.example.org/?token=SECRETVALUE")
+    except ValueError as exc:
+        refusals.append(str(exc))
+    check(len(refusals) == 1 and "SECRETVALUE" not in refusals[0],
+          "a refused --verify-host is not echoed, a token may sit in it  "
+          "<-- pinned defect")
     raises(lambda: check_hosts("https://old.example.org",
                                "https://elsewhere.example.org",
                                "new.example.org"),
@@ -4091,6 +4105,36 @@ def _self_test():
                   "a secret typed in the old --flag VALUE form, before or as "
                   "the mode, is refused without being echoed (%s)  "
                   "<-- pinned defect" % argv[0])
+        for argv, label in (
+                (["diff", "a.json", "b.json", "--token", "SECRETVALUE"],
+                 "after the two paths diff takes"),
+                (["snapshot", "a", "b", "--password", "SECRETVALUE"],
+                 "after two stray words"),
+                (["watch", "--dir", "d", "x", "y", "--token=SECRETVALUE"],
+                 "as a --flag=value after two stray words"),
+                (["snapshot", "--apply=SECRETVALUE"], "as the value of --apply"),
+                (["snapshot", "--self-test=SECRETVALUE"],
+                 "as the value of --self-test"),
+                (["snapshot", "--window-minutes", "SECRETVALUE"],
+                 "as the value of --window-minutes")):
+            sys.stderr = io.StringIO()
+            refused = None
+            try:
+                _parse(argv)
+            except SystemExit as exc:
+                refused = exc.code
+            leaked = sys.stderr.getvalue()
+            check(refused == 64 and "SECRETVALUE" not in leaked,
+                  "a secret typed %s is refused without being echoed  "
+                  "<-- pinned defect" % label)
+        sys.stderr = io.StringIO()
+        try:
+            _parse(["diff", "a.json", "b.json", "--token", "SECRETVALUE", "x"])
+        except SystemExit:
+            pass
+        check("--token" in sys.stderr.getvalue()
+              and "2 other word(s) not shown" in sys.stderr.getvalue(),
+              "the flag name is shown and the other words are only counted")
     finally:
         sys.stderr = noise
 
@@ -4601,8 +4645,21 @@ class _Parser(argparse.ArgumentParser):
     """
 
     def error(self, message):
+        # argparse quotes the value of a flag that takes none, so a secret
+        # typed as --apply=VALUE would reach stderr. Keep the flag, drop the value.
+        marker = "ignored explicit argument"
+        if marker in message:
+            message = message.split(marker)[0] + "takes no value"
         self.print_usage(sys.stderr)
         self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
+def _minutes(text):
+    """A whole number of minutes. The text is not echoed, as it may be a secret."""
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number of minutes")
 
 
 def _parse(argv):
@@ -4663,7 +4720,7 @@ def _parse(argv):
                                   "the definition update, such as Create")
     ap.add_argument("--out", help="directory to write the snapshot into")
     ap.add_argument("--dir", help="directory of snapshots, for watch")
-    ap.add_argument("--window-minutes", dest="window_minutes", type=int,
+    ap.add_argument("--window-minutes", dest="window_minutes", type=_minutes,
                     default=DEFAULT_WINDOW_MINUTES,
                     help="minutes within which one owner's changes collapse "
                          "into one event (default %d)" % DEFAULT_WINDOW_MINUTES)
@@ -4679,9 +4736,14 @@ def _parse(argv):
     args, extra = ap.parse_known_args(argv)
     if extra:
         # argparse echoes an unknown argument whole, and a mistyped
-        # --flag=value carries its value into the error. Only the name is shown.
-        ap.error("unrecognized arguments: %s"
-                 % " ".join(arg.split("=", 1)[0] for arg in extra))
+        # --flag=value carries its value into the error. A value typed after an
+        # unknown flag lands in `extra` as a leftover word too. Only long flag
+        # names are shown; every other word is counted and not printed.
+        names = [arg.split("=", 1)[0] for arg in extra if arg.startswith("--")]
+        hidden = len(extra) - len(names)
+        ap.error("unrecognized arguments: %s%s"
+                 % (" ".join(names),
+                    " (%d other word(s) not shown)" % hidden if hidden else ""))
     if args.mode is not None and args.mode not in MODES:
         # Not argparse's choices=: its error prints the rejected word, and a
         # secret typed as "--token VALUE" before the mode lands here as the mode.
