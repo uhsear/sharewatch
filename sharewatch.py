@@ -226,11 +226,11 @@ def is_truncated(total):
     return total >= SEARCH_CEILING
 
 
-URL_SECRET_KEYS = ("token", "access_token", "password")
-URL_RULE = ("must start with https:// or http:// and carry no user:password@ "
-            "or token= part. urllib quotes a url it cannot open back into its "
-            "own error, so a credential typed into the url would reach the "
-            "log. Pass a token in the environment instead")
+URL_RULE = ("must start with https:// or http:// and carry no user:password@, "
+            "query string, fragment or ;parameter. urllib quotes a url it "
+            "cannot open back into its own error, so a credential typed into "
+            "the url, under any name, would reach the log. Pass a token in "
+            "the environment instead")
 
 
 def is_http_url(url):
@@ -238,10 +238,11 @@ def is_http_url(url):
 
     A url typed without its scheme is the common mistake, and urllib answers it
     by raising an exception that quotes the whole url back, query string and
-    token included. A url that carries user:password@ or a token in its query
-    string reaches stderr the same way, and redact() knows only the secrets the
-    tool itself holds. Refusing the url up front is what stops a credential
-    reaching a scheduler log.
+    token included. A url that carries user:password@ or any query string
+    reaches stderr the same way, and redact() knows only the secrets the tool
+    itself holds, not an API key under a name nobody listed. A portal or
+    service url needs no query string, so refusing every query, fragment and
+    ;parameter up front is what stops a credential reaching a scheduler log.
     """
     if not url or not url.lower().startswith(("http://", "https://")):
         return False
@@ -249,13 +250,8 @@ def is_http_url(url):
         parts = urllib.parse.urlsplit(url)
     except ValueError:
         return False
-    if "@" in parts.netloc:
-        return False
     # An OAuth redirect puts the token in the fragment, as #access_token=.
-    keys = set(key.lower() for key, _v in
-               urllib.parse.parse_qsl(parts.query + "&" + parts.fragment,
-                                      keep_blank_values=True))
-    return not keys.intersection(URL_SECRET_KEYS)
+    return "@" not in parts.netloc and not any(c in url for c in "?#;")
 
 
 def printable(text, encoding):
@@ -1126,6 +1122,20 @@ def capability_findings(layers, was):
     return findings, gaps
 
 
+def assumed_open(layers, was):
+    """Labels of the layers whose open anonymous count was taken as old news.
+
+    --was is one list for the whole service. When it holds Query, every layer
+    that answers a stranger is treated as readable before, so a layer that was
+    Create-only and has just opened would read clean. The run names those
+    layers so the reader can check them one by one.
+    """
+    if "query" not in was:
+        return []
+    return ["layer %s (%s)" % (layer["id"], layer["name"]) for layer in layers
+            if layer["anon"][0] == "open"]
+
+
 # ---------------------------------------------------------------- portal i/o
 
 def _opener(insecure, pin_host=None):
@@ -1686,8 +1696,15 @@ def _self_test():
               "a url with %s is refused, because the error urllib raises "
               "quotes it back and redact() cannot know it  <-- pinned "
               "defect" % label)
-    check(is_http_url("https://example.org/svc?f=json&where=1%3D1") is True,
-          "a query string with no credential in it is accepted")
+    for url, label in (
+            ("https://example.org/svc?apikey=KEYSECRET", "an api key"),
+            ("https://example.org/svc?f=json&where=1%3D1", "any query string"),
+            ("https://example.org/svc?", "an empty query string"),
+            ("https://example.org/svc#", "an empty fragment"),
+            ("https://example.org/svc;key=KEYSECRET", "a ;parameter")):
+        check(is_http_url(url) is False,
+              "a url with %s is refused, a secret under a name nobody listed "
+              "would be quoted back by urllib  <-- pinned defect" % label)
     check(is_http_url("") is False, "an empty url is refused")
     check(is_http_url(None) is False, "a missing url is refused")
     snap = build_snapshot("https://x", "t", {"a": item("a", "o", "org", 1)},
@@ -2612,9 +2629,11 @@ def _self_test():
                   and "No sharing changes" not in seen,
                   "watch read by %s cannot call a day quiet: it exits 3  "
                   "<-- pinned defect" % label)
-            check(json.load(io.open(os.path.join(
-                part_dir, sorted(os.listdir(part_dir))[-1]), "r",
-                encoding="utf-8")).get("limited") is True,
+            with io.open(os.path.join(
+                    part_dir, sorted(os.listdir(part_dir))[-1]), "r",
+                    encoding="utf-8") as handle:
+                limited = json.load(handle).get("limited")
+            check(limited is True,
                 "the snapshot records that its account saw only part of the "
                 "org, so a later diff of two files says so too")
         code, seen = captured(lambda: serving(
@@ -4333,6 +4352,22 @@ def _self_test():
           and found[1]["layer"] < found[2]["layer"],
           "findings are ranked worst first and then by layer, with several "
           "layers read")
+    found, gaps = capability_findings(
+        [lay("Create,Update", CLOSED, 0, "A"), lay("Create", OPEN, 1, "B")],
+        was_create)
+    check([f["kind"] for f in found] == ["cap-flip-open", "cap-added"]
+          and found[0]["layer"] > found[1]["layer"],
+          "a worse finding on a later layer ranks above a milder one on an "
+          "earlier layer, so the severity key is what orders them  "
+          "<-- pinned defect")
+    check(assumed_open([lay("Query", OPEN, 0, "A"), lay("Query", CLOSED, 1, "B"),
+                        lay("Query", UNSURE, 2, "C")],
+                       parse_capabilities("Create,Query"))
+          == ["layer 0 (A)"]
+          and assumed_open([lay("Query", OPEN)], was_create) == [],
+          "only a layer that answers a stranger under a --was with Query is "
+          "named as taken for old news; a --was with no Query names none  "
+          "<-- pinned defect")
 
     # The service, over a real socket. Every answer is the stub's own and none
     # of it is an Esri response: the stub states what the server is made to say.
@@ -4436,6 +4471,12 @@ def _self_test():
     check(code == 0 and "No capability flip" in seen,
           "a view that was readable before and is now is not reported  "
           "<-- pinned defect")
+    check("Note: --was holds Query for every layer" in seen
+          and "layer 0 (Reports)" in seen.split("Note:")[1],
+          "a run that took an open layer as old news says so and names it, "
+          "because one --was serves every layer  <-- pinned defect")
+    check("Note:" not in run_caps(quiet_view)[1],
+          "a run with no open layer prints no note")
     unlisted_view = FakeService({0: {"name": "Reports", "capabilities": "Create",
                                       "anon_count": 8}})
     code, seen = run_caps(unlisted_view)
@@ -4598,10 +4639,10 @@ def _self_test():
               "Create Query"], "comma-separated list",
              "a space-separated --was"),
             (["caps", "--service-url", "https://h/x/FeatureServer?f=json",
-              "--was", "Create"], "no query string",
+              "--was", "Create"], "query string",
              "a --service-url with a query string"),
             (["caps", "--service-url", "https://h/x/FeatureServer#top",
-              "--was", "Create"], "no query string",
+              "--was", "Create"], "query string",
              "a --service-url with a fragment"),
             (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
               "Create", "--apply"], "writes nothing", "--apply on caps"),
@@ -5075,10 +5116,6 @@ def _caps(args):
     if not is_http_url(args.service_url):
         print("error: --service-url %s." % URL_RULE, file=sys.stderr)
         return 64
-    if "?" in args.service_url or "#" in args.service_url:
-        print("error: --service-url takes the bare service or layer url, with "
-              "no query string or fragment (drop ?f=json).", file=sys.stderr)
-        return 64
     was = parse_capabilities(args.was)
     if not was:
         print("error: --was has to name at least one capability, such as "
@@ -5115,6 +5152,13 @@ def _caps(args):
             found["detail"]), encoding))
     if findings and gaps:
         print(printable("Also cannot tell: %s." % "; ".join(gaps), encoding))
+    assumed = assumed_open(layers, was)
+    if assumed:
+        print(printable(
+            "Note: --was holds Query for every layer, so an anonymous count "
+            "that works on %s is taken as the state before. If one of them "
+            "was Create-only, run caps on that layer's url with its own --was."
+            % ", ".join(assumed), encoding))
     return exit_code(findings, bool(gaps))
 
 

@@ -175,7 +175,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 ...
-605 assertions, 0 failed
+613 assertions, 0 failed
 ```
 
 ## Requirements
@@ -183,9 +183,9 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 605 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 613 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. The self-test also passed with the same 605 assertions on CPython 3.9.25 and 3.10.20 on the
+there. The self-test also passed with the same 613 assertions on CPython 3.9.25 and 3.10.20 on the
 Windows workstation, which is the oldest version it was run on.
 `arcpy` is not used and the `arcgis` package is not needed.
 
@@ -621,13 +621,14 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows (2456 statements, 550 branches), measured with `coverage run --branch`. The Linux host
-  has no `coverage` module installed, so the Linux run reports the assertion count only.
+- Coverage is 100 percent branch on Windows (2464 statements, 552 branches), measured with `coverage run --branch`. The Linux host
+  has no `coverage` module installed, so the Linux run reports the assertion count only. The Windows-only
+  `ctypes` console branches run only on Windows, so no Linux coverage figure exists for them.
 
 More limits, each one a sentence:
 
 - A mutation run changed the pure core and the command line 443 times. After this round the item type, the secret guard in `redact` and the anonymous group search are pinned. The survivors left are equivalent or cosmetic.
-- A spot check of the `caps` code changed it 20 times by hand. The first run left one survivor, the ranking sort, and an assertion now pins it. Of 22 caps mutants tried by hand later, 20 turned the self-test red and 2 survived, both listed below. It is a sample, not a sweep.
+- A spot check of the `caps` code changed it 20 times by hand. The first run left one survivor, the ranking sort, and a fixture where layer order and severity order disagree now pins it. Of 22 caps mutants tried by hand later, 20 turned the self-test red and 2 survived, both listed below. It is a sample, not a sweep.
 - Those survivors are the `__main__` guard, the error message format, the progress echo, the rule line width, the token expiration of 60 and `describe()` choosing a group id over its title.
 - Four boundaries would not turn the self-test red: the collapse window arithmetic, the 20-item list cap in `describe`, `--window-minutes 0` being accepted, and the detail text of `mirror-new-shared` for an item.
 - A group that exists only on the new portal is reported when it is public or org-wide, and not when it is private.
@@ -647,8 +648,7 @@ More limits, each one a sentence:
 - A `--responses` entry whose `itemId` is a JSON list raises `TypeError` and ends as exit 2 with `unexpected TypeError`.
 - `watch` picks its baseline by file name only. A file named `sharewatch-` plus anything, or a snapshot of another portal in the same `--dir`, can become the baseline.
 - A snapshot is written non-atomically. A full disk can leave a truncated newest file, and the next `watch` run stops with exit 64 on it.
-- A `--url`, `--old-url`, `--new-url` or `--service-url` that carries `user:password@`, or `token`, `access_token` or `password` in its query string or its fragment, is refused with exit 64 and is never printed back. Another secret in a query string, such as an API key under a name this check does not know, is still printed in an error.
-- The stored `url` of a snapshot is whatever `--url` held, so it can hold a query string if you typed one.
+- A `--url`, `--old-url`, `--new-url` or `--service-url` that carries `user:password@`, a query string, a fragment or a `;parameter` is refused with exit 64 and is never printed back, whatever name the secret has. A secret typed into the path of such a url is still printed in an error.
 - A `--username` sign-in over an `http://` url sends the password in clear text. Use `https://`.
 - The redirect pin compares host names only, so a redirect from https to http, or to another port on the same host, is followed.
 - Tokens travel as query parameters on GET requests, so a proxy or portal access log on the path records them.
@@ -692,7 +692,6 @@ More limits, each one a sentence:
 - A usage error prints only the long flag names, and counts any other word it does not show. A one-letter flag is counted like any other word.
 - The Mirror and Caps sample blocks come from stub runs that are not shipped. The Caps block was re-run against an independent `http.server` stub and gave the same output with exit 1, but that stub is not in the repository either.
 - The counts of changes in the mutation runs come from a harness that is not in this repository. Treat them as the author's report and not as something you can run.
-- The severity key of the caps ranking sort is not pinned by a fixture where layer order and severity order disagree. Dropping it from the sort in `capability_findings` still passes the self-test.
 - Changing `if findings and gaps:` to `if gaps:` in `caps` only repeats the cannot-tell text on a run with gaps and no findings. It changes neither the verdict nor the exit code, so the self-test does not pin it.
 - A file path given to `diff` or `--responses` that does not exist is echoed in the error text, so do not type a secret as a path.
 - In `snapshot`, a console code page that cannot encode the `--query` or the snapshot path can raise after the file is already written.
@@ -708,7 +707,7 @@ More limits, each one a sentence:
 - A body error code is matched only as an integer. A string code such as `"403"` counts as unknown, so the run exits 3 or reports the flip as inconclusive. That fails safe.
 - A missing password exits 2, the same as a portal failure, though it is a configuration error.
 - A `--query` or `--url` holding characters the console code page cannot encode, such as Greek on cp1252, stops with `unexpected UnicodeEncodeError` and exit 2 after some output.
-- A `--service-url` with a query string or a fragment, such as `.../FeatureServer?f=json`, is refused with exit 64, because `/0` would be appended after the query.
+- A `--service-url` such as `.../FeatureServer?f=json` is refused with exit 64 like any url with a query string.
 - The redirect pin compares host names only. A same-host redirect from `https` to `http`, or to another port, is followed and carries the token in clear text.
 - Item titles, owners, group names and messages in a `--responses` file are printed raw, so a member of the organization can forge a line that looks like a finding. The exit code is not affected.
 - Snapshot writes are not atomic, and two `--apply` runs in the same second overwrite each other.
@@ -718,10 +717,17 @@ More limits, each one a sentence:
 - Text read from a `--responses` file, and the `unexpected <Type>` line, are printed as written. Remove tokens from saved responses before you pass them in.
 - The `--username` path was tested only against a stub that does not check the `Referer` header, and it was not run against a live portal. A portal that rejects a referer-bound token arriving without a `Referer` header would show as exit 2, not as a false clean.
 - An HTTP 403 from a proxy or firewall in front of the service is read as a refusal by the service. A layer can then be called closed when the gateway, not the service, refused the stranger, and `caps` exits 0 for a layer that is readable by a browser the gateway lets through.
-- `caps` applies one `--was` to every layer. When the layers of one service held different capabilities, run `caps` once per layer url, because a `--was` containing `Query` silences the open-count finding on every layer.
+- `caps` applies one `--was` to every layer. A `--was` containing `Query` silences the open-count finding on every layer, so when the layers of one service held different capabilities, run `caps` once per layer url. A run with such a `--was` prints a `Note:` line that names each layer whose open count it took as old news, and its exit code is unchanged.
 - `diff` does not check that its two snapshots came from the same portal url. Two portals in one `watch --dir` give a false diff with exit 1.
 - That an organization content report is a CSV with one row per item including its access is not cited here and was not exercised. Neither were the ArcGIS Enterprise portal logs or the ArcGIS Online activity report.
-- On a public Create-only view whose anonymous query Esri answers with an error code other than 401, 403, 498 or 499, `caps` exits 3 on every run until that code is known. This is the safe direction.
+- On a public Create-only view whose anonymous query Esri answers with an error code other than 401, 403, 498 or 499, `caps` exits 3 on every run until that code is known. This is the safe direction. The code Esri returns for a Create-only view was not checked against Esri documentation, so a routine clean run may never exit 0.
+- The README does not cite Esri for the anonymous-refusal shapes: HTTP 401 or 403, or an error object with 498 or 499 inside an HTTP 200. `caps` accepts both, and the closed or open decision rests on observed behaviour only.
+- `caps` reads layers one after another. If a later layer cannot be read, the run exits 2 and reports nothing about the layers already read, so run it again or run it once per layer url.
+- `--was Create` is the example, but Esri's own example `capabilities` string pairs `Editing` with `Create` and `Query`. A real Create-only view that lists `Create,Editing` reads as `cap-added` and exits 1 on a clean day. That is a false alarm, not a false clean, and what a live Create-only view lists was not checked.
+- If `portals/self` gives no org id, `snapshot` and `watch` with `--query` search groups with the item query. The run can then exit 0 with groups missing, and the warning is the only signal. Esri normally sends an id, and this was not run.
+- A group row with no `id` would put `None` in the group map and end the run with exit 2 at the sort. Esri sends an id for every group, and this was not run.
+- The Esri quotes were checked against Esri's pages: the activity report text "a log of all activity in your organization for a specified time period" ([report fields][aoreport]), the `capabilities` example string, the `Query` requirement and the `returnCountOnly` count ([feature layer][layerref], [query][queryref]). The organization content report and the Enterprise portal logs were not exercised.
+- The Microsoft claim about `GetConsoleMode` is from https://learn.microsoft.com/en-us/windows/console/getconsolemode.
 
 ## Contributing
 
