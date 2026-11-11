@@ -526,8 +526,8 @@ deletions it invents thousands. The diff still runs, since the widenings in it a
 
 ## Why not the tools that already exist
 
-For the two-portal comparison I know of no tool that does it. A search of GitHub for `sharemirror`
-finds two repositories on 2026-10-29, and neither is related: one is a Windows utility that
+For the two-portal comparison, a GitHub search for `sharemirror` on 2026-10-29
+found two repositories, and neither is related: one is a Windows utility that
 mirrors what is on screen, the other has no description and no ArcGIS content that I found. Searches for an
 ArcGIS sharing audit and for portal migration with groups and sharing returned nothing. That is what
 the search found, and it does not prove nothing exists. The `arcgis` Python API documents the same
@@ -627,7 +627,7 @@ too.
 More limits, each one a sentence:
 
 - A mutation run changed the pure core and the command line 443 times. After this round the item type, the secret guard in `redact` and the anonymous group search are pinned. The survivors left are equivalent or cosmetic.
-- A spot check of the `caps` code changed it 20 times by hand. The first run left one survivor, the ranking sort, and an assertion now pins it. All 20 turn the self-test red. It is a sample, not a sweep.
+- A spot check of the `caps` code changed it 20 times by hand. The first run left one survivor, the ranking sort, and an assertion now pins it. Of 22 caps mutants tried by hand later, 20 turned the self-test red and 2 survived, both listed below. It is a sample, not a sweep.
 - Those survivors are the `__main__` guard, the error message format, the progress echo, the rule line width, the token expiration of 60 and `describe()` choosing a group id over its title.
 - Four boundaries would not turn the self-test red: the collapse window arithmetic, the 20-item list cap in `describe`, `--window-minutes 0` being accepted, and the detail text of `mirror-new-shared` for an item.
 - A group that exists only on the new portal is reported when it is public or org-wide, and not when it is private.
@@ -692,6 +692,10 @@ More limits, each one a sentence:
 - A usage error prints only the long flag names, and counts any other word it does not show. A one-letter flag is counted like any other word.
 - The Mirror and Caps sample blocks come from stub runs that are not shipped. The Caps block was re-run against an independent `http.server` stub and gave the same output with exit 1, but that stub is not in the repository either.
 - The counts of changes in the mutation runs come from a harness that is not in this repository. Treat them as the author's report and not as something you can run.
+- The severity key of the caps ranking sort is not pinned by a fixture where layer order and severity order disagree. Dropping it from the sort in `capability_findings` still passes the self-test.
+- Changing `if findings and gaps:` to `if gaps:` in `caps` only repeats the cannot-tell text on a run with gaps and no findings. It changes neither the verdict nor the exit code, so the self-test does not pin it.
+- A file path given to `diff` or `--responses` that does not exist is echoed in the error text, so do not type a secret as a path.
+- In `snapshot`, a console code page that cannot encode the `--query` or the snapshot path can raise after the file is already written.
 - The self-test pins HTTP 400, 404, 407, 408, 429 and 503, and body codes 400, 404, 407, 408, 429 and 500, as unknown. It pins no other status.
 - The Limits section is long. The limits that change an exit code are the ones about exit 3, an administrator token, the search ceiling and the host pin.
 - The sharing-change example near the Mirror section, with `item-public`, `group-public` and `item-deleted`, is illustrative and not a captured run. The count of 30 requests against 4,000 in the paging section is an estimate.
