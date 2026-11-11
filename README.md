@@ -2,7 +2,8 @@
 
 Diff your ArcGIS organization's sharing posture against yesterday, because the platform keeps no
 audit log. Read-only, never changes sharing. The `mirror` mode does the same comparison between
-two portals, for the day after a cutover.
+two portals, for the day after a cutover. The `caps` mode re-reads a view's capabilities after a
+definition update and asks it for rows with no token, for the minute after an edit.
 
 An internal layer holding addresses with occupant names is public. A resident found it and
 called. Somebody shared a folder to Everyone last week to fix a colleague's access problem, and
@@ -15,6 +16,13 @@ were sent with an empty `groups` value, because the group lookup had come up emp
 answered 200 too. Nobody read the lists. A week later the staff who used a planning layer could not
 open it, and a layer that was org-only on the old portal was public on the new one. The `mirror`
 mode reads what each portal holds and reports the difference, instead of trusting the log.
+
+A third morning, after a small edit. A public form view took reports from residents. It held
+`Create` and nothing else, so a stranger could add a row and could not read one. A script hid one
+field on that view through a definition update. The update worked, and the script said so. Afterwards
+the layer's capabilities listed `Query` as well, and a request with no token could read the view.
+Nobody read the capabilities again. The `caps` mode is that second read, and it also asks the view
+for rows the way a stranger would.
 
 ArcGIS Online has no sharing audit log. The portal will tell you the layer is public right now,
 and nothing else: not when it changed, not who changed it, not what else moved with it. The
@@ -93,12 +101,17 @@ PASS  a token for one portal is never sent to the other  <-- pinned defect
 PASS  a host refusal is made before any request is sent  <-- pinned defect
 PASS  a new url that answers but declares another host is refused, so a DNS alias left on the old portal is caught  <-- pinned defect
 ...
+PASS  Query added and an anonymous count that works is the flip, open
+PASS  a layer that does not list Query and answers an anonymous count is reported, because the answer is the exposure  <-- pinned defect
+PASS  a count the server failed to answer is exit 3, not a clean 0  <-- pinned defect
+PASS  the capabilities are read with the token and the count is asked with no token at all  <-- pinned defect
+...
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted and two failed portal calls as six failures, so a broken tool turns this self-test red  <-- pinned defect
 ...
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 --------------------------------------------------------------------
-483 assertions, 0 failed
+547 assertions, 0 failed
 ```
 
 ## Requirements
@@ -106,7 +119,7 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 483 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 547 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
 there. Python 3.9 is checked by parsing the file for 3.9 syntax, not by running it on 3.9.
 `arcpy` is not used and the `arcgis` package is not needed.
@@ -124,7 +137,8 @@ stand-in portal that answers inside the process.
 
 The `mirror` mode is run against `http.server` on the loopback addresses `127.0.0.1` (the new
 portal) and `127.0.0.2` (the old one), so redirects, the sign-in POST and the host proof go
-through urllib and a real socket. The self-test therefore opens loopback sockets, and nothing else.
+through urllib and a real socket. The `caps` mode is run the same way against a stub feature
+service, and its redirect refusal against a second loopback address. The self-test therefore opens loopback sockets, and nothing else.
 It needs no network and no credentials, but it does need a machine where `127.0.0.2` is loopback.
 That holds on Windows and on Linux, which are the two hosts it was run on. It is not run on macOS,
 which binds only `127.0.0.1` by default.
@@ -148,8 +162,8 @@ python sharewatch.py watch --url https://example.maps.arcgis.com --username gis_
 
 | Flag | Default | What it does |
 |---|---|---|
-| `mode` | none | `snapshot`, `diff`, `watch` or `mirror`. Required. |
-| `--url` | none | Portal url, including `https://`. Required except for `diff`. |
+| `mode` | none | `snapshot`, `diff`, `watch`, `mirror` or `caps`. Required. |
+| `--url` | none | Portal url, including `https://`. Required except for `diff`, `mirror` and `caps`. For `caps` it is only the portal that signs `--username` in. |
 | `--query` | org id | Item search query. Defaults to `orgid:` of the signed-in organization. Groups are always searched by org id. |
 | `--username` | none | Generate a token for this user. |
 | `--out` | none | Directory to write the snapshot into. |
@@ -161,7 +175,9 @@ python sharewatch.py watch --url https://example.maps.arcgis.com --username gis_
 | `--old-username`, `--new-username` | none | `mirror`: generate a token on that portal. |
 | `--old-query`, `--new-query` | org id | `mirror`: the item search query on each side. |
 | `--responses` | none | `mirror`: a JSON file of saved share-call responses to check for `notSharedWith`. |
-| `--apply` | off | Write the snapshot file. Without it nothing is written. Refused by `mirror`. |
+| `--service-url` | none | `caps`: the `FeatureServer` url of the view, or of one layer, including `https://`. Required. |
+| `--was` | none | `caps`: the capabilities the view held before the update, such as `Create`. Required. |
+| `--apply` | off | Write the snapshot file. Without it nothing is written. Refused by `mirror` and `caps`. |
 | `--self-test` | off | Run the offline assertions and exit. |
 
 There is no `--password` flag, and there never will be. `argv` is readable by every process on
@@ -187,8 +203,8 @@ Exit codes:
 |---|---|
 | 0 | No differences, and the read was whole. |
 | 1 | Anything to read. A narrowing or a deletion is a difference too, so 1 does not mean "something widened". |
-| 2 | The portal call failed, a mirror host proof failed, or the tool hit an error it does not know. |
-| 3 | No differences found, but the read cannot prove it: it held no items, was cut short, was made without a token, or left group memberships unread. A `watch` run without `--apply` and without a baseline also exits 3. |
+| 2 | The portal or service call failed, a mirror host proof failed, or the tool hit an error it does not know. |
+| 3 | No differences found, but the read cannot prove it: it held no items, was cut short, was made without a token, or left group memberships unread. A `watch` run without `--apply` and without a baseline also exits 3. For `caps`: a layer that lists no capabilities, or an anonymous count that gave no usable answer, with no flip found. |
 | 64 | Usage error, a corrupt baseline file, or a sharing level this version does not know. |
 
 A scheduler that alerts only on 1 and 2 treats 3 as success. Alert on any non-zero code.
@@ -291,6 +307,73 @@ and `SHAREWATCH_NEW_PASSWORD`, or an unechoed prompt, and never a flag.
 [searchref]: https://developers.arcgis.com/rest/users-groups-and-items/search-reference/
 [searchpage]: https://developers.arcgis.com/rest/users-groups-and-items/search/
 
+## Caps: did a definition update open the view
+
+```
+export SHAREWATCH_TOKEN='...'
+python sharewatch.py caps --service-url https://services.example.org/rest/services/Form_view/FeatureServer --was Create
+```
+
+Run it right after a definition update. `--was` lists the capabilities the view held before the
+update. For each layer and table of the service, `caps` does three things:
+
+1. It reads the service root, which lists the layers and tables. A url that ends in a layer number
+   reads that one layer.
+2. It reads each layer's `capabilities` with your token. Esri documents the property as one
+   comma-separated string, such as `Create,Delete,Query,Update,Editing` ([feature layer][layerref]).
+3. It asks each layer for a row count with no token at all: `query?where=1=1&returnCountOnly=true`.
+   The Query operation needs the `Query` capability ([query][queryref]), and `returnCountOnly`
+   makes the answer a `count` ([query][queryref]).
+
+The count decides, and the list is the evidence. A layer that did not hold `Query` and now answers
+a stranger with a count is the flip, whatever its capabilities say.
+
+A real run against a local `http.server` stub holding synthetic data. Layer 0 gained `Query`, layer
+1 did not change, and layer 2 gained `Update`. The stub is not shipped. The self-test has its own
+fixtures and a run against them, so you cannot regenerate this exact block from the repository:
+
+```
+read 3 layer(s) on host 127.0.0.1
+--------------------------------------------------------------------
+[100] cap-flip-open  layer 0 (Reports): an anonymous query returned a count of 12 and this view was not readable before (was Create, now Create,Query)
+[ 70] cap-added      layer 2 (Review notes): Update,Editing added (was Create, now Create,Update,Editing). Writes are never probed here
+```
+
+The exit code was 1. Layer 1 is not printed, because nothing changed on it.
+
+| Severity | Kind | Meaning |
+|---|---|---|
+| 100 | `cap-flip-open` | A count with no token returned rows from a layer whose `--was` did not hold `Query`. |
+| 70 | `cap-added` | A capability other than `Query` was added. It is read from the list, never probed. |
+| 60 | `cap-flip` | `Query` was added, and the anonymous count was refused or gave no answer. The view is not readable by strangers today. Check its sharing before it reaches Everyone. |
+
+How it reads the anonymous count:
+
+- Rows came back: open. A count of 0 is open, because an empty layer still answers.
+- An HTTP 4xx status, or an error object with a 4xx code: closed.
+- Anything else is unknown. That covers a 5xx, a timeout, a refused connection, a page that is not
+  JSON and a 200 with neither a count nor an error. Unknown is never called closed. If `Query` was
+  added, the finding says the count was inconclusive. If nothing was found, the run exits 3.
+- A view whose `--was` already held `Query` is never a flip. Its count works because it did before.
+
+The refusal in the stub comes both ways: an HTTP 403 status in process, and an error object with
+HTTP 200 over the socket. Esri's REST reference does not say which one a layer uses for a stranger.
+The error object inside a 200 is what Esri community posts describe, and `caps` accepts both.
+
+Why the cause is not claimed. Esri's page on hosted views says "You can exclude fields from the
+view" and that you can "share a read-only feature layer view with the public"
+([hosted views][viewsref]). It does not say that excluding a field changes the capabilities. The
+update itself is the `updateDefinition` operation on the admin endpoint
+([update definition][updatedef]). The flip was seen in one case. `caps` reads the result, so it
+catches the same outcome from any other edit.
+
+[layerref]: https://developers.arcgis.com/rest/services-reference/enterprise/feature-layer/
+[queryref]: https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/
+[updatedef]: https://developers.arcgis.com/rest/services-reference/enterprise/update-definition-feature-layer/
+[viewsref]: https://doc.esri.com/en/arcgis-online/latest/manage-data/create-hosted-views.html
+[featuresapi]: https://developers.arcgis.com/python/latest/api-reference/arcgis.features.toc.html
+
+
 ## What it records
 
 Per item: id, title, owner, type, access, the ids of the groups it is shared to, and the modified
@@ -358,6 +441,10 @@ plausible-looking `--unshare` is rejected rather than ignored. It asserts the sa
 against the socket stub: every request it made was one of the three read paths, and the only POST
 is the sign-in.
 
+`caps` sends GET requests only: the service root, each layer, and one `query` per layer. The
+self-test asserts that it sends no POST when a token is in the environment, that every path it
+asked for is under the service url, and that the `query` request carries no token.
+
 Every parser has `allow_abbrev=False`, so no prefix of a flag is accepted. `--ap` is refused, and
 `--verify` is not read as `--verify-host`.
 
@@ -397,6 +484,13 @@ ArcGIS Enterprise portal logs do record some sharing calls, which is more than A
 offers. They are per-deployment, they roll over, and they are not searchable by item. If you are
 on Enterprise, read them first.
 
+For the capability flip, the tool that exists is the service itself. Open the layer's REST page,
+or read `FeatureLayer.properties` in the `arcgis` Python API ("retrieves and set properties of this
+object", [arcgis.features][featuresapi]), and the `capabilities` string is there. That is the right
+way to read one layer once, and it is exact. It gives you the state now. It does not give you the
+state before the edit, and it does not ask the layer for rows with no token, which is the question
+that matters. `caps` takes the before from `--was` and runs the anonymous count.
+
 The trap worth naming is in the diff itself. The obvious version walks the item ids and compares
 them:
 
@@ -434,8 +528,9 @@ too.
   store instead.
 - Folders are not snapshotted. Items are, and an item's access is what actually governs who can
   see it.
-- It does not check item permissions on the underlying services. A feature service can be open to
-  the world while its item is private.
+- `snapshot`, `diff`, `watch` and `mirror` do not check item permissions on the underlying
+  services. A feature service can be open to the world while its item is private. `caps` does, for
+  one service at a time: it asks each layer for a count with no token.
 - The item count on a group finding counts the items in the snapshot, not the group. An item the
   query did not cover is in the group and not in the count.
 - A `membershipAccess` that narrows is not reported, and `null` is read as `org`, because `null`
@@ -458,12 +553,13 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows, measured with `coverage run --branch`. The Linux host
+- Coverage is 100 percent branch on Windows (2284 statements, 500 branches), measured with `coverage run --branch`. The Linux host
   has no `coverage` module installed, so the Linux run reports the assertion count only.
 
 More limits, each one a sentence:
 
 - A mutation run changed the pure core and the command line 443 times. After this round the item type, the secret guard in `redact` and the anonymous group search are pinned. The survivors left are equivalent or cosmetic.
+- A spot check of the `caps` code changed it 20 times by hand. The first run left one survivor, the ranking sort, and an assertion now pins it. All 20 turn the self-test red. It is a sample, not a sweep.
 - Those survivors are the `__main__` guard, the error message format, the progress echo, the rule line width, the token expiration of 60 and `describe()` choosing a group id over its title.
 - Four boundaries would not turn the self-test red: the collapse window arithmetic, the 20-item list cap in `describe`, `--window-minutes 0` being accepted, and the detail text of `mirror-new-shared` for an item.
 - A group that exists only on the new portal is reported when it is public or org-wide, and not when it is private.
@@ -493,7 +589,18 @@ More limits, each one a sentence:
 - An event lists its first 20 items and counts the rest, so a bulk finding does not name every item.
 - With no console and no `SHAREWATCH_PASSWORD`, the password prompt fails with `unexpected EOFError`, exit 2, and no hint to set the variable.
 - An empty `SHAREWATCH_PASSWORD` or token variable is treated as unset.
-- The `snapshot`, `diff` and `watch` network paths run against an in-process stand-in. Only `mirror` and the shared request layer run over real loopback sockets.
+- The `snapshot`, `diff` and `watch` network paths run against an in-process stand-in. Only `mirror`, `caps` and the shared request layer run over real loopback sockets.
+- `caps` was run against stubs only. It was never run against a live ArcGIS Online or Enterprise service, and the stub's refusals are the stub's own words, not recorded Esri answers.
+- Esri documents the `capabilities` string and the `Query` capability. It does not document that hiding a field adds `Query`. That came from one case, and `caps` reads the result, so it does not depend on the cause.
+- `caps` takes one `--was` for every layer and table of the service. Run it once per layer url when the layers differ.
+- `caps` compares layers and tables, not the service root's own `capabilities` string.
+- `caps` probes reads only. A `Create`, `Update` or `Delete` that was added is reported from the list. The tool never writes, so it cannot test an anonymous edit.
+- `caps` does not read the item's sharing. A flip on a view that is not shared to Everyone is `cap-flip`, ranked 60, with the sharing check left to you.
+- A view that held `Query` before is not reported, and that is by design: there is no flip. It also means `caps` is not an audit of every readable view.
+- An anonymous count that fails with a 5xx, a timeout, a refused connection or an answer that is not JSON is exit 3. A refusal is a 4xx status or an error object with a 4xx code. A layer that answers a stranger in some other way, such as a 200 without `count`, is exit 3 too.
+- The refusal as an error object inside an HTTP 200 comes from Esri community posts and not from the REST reference. `caps` accepts a 4xx status or a 4xx code in the body, so it does not depend on which one a server uses.
+- The `where=1=1` count is the only probe. A layer with a definition query counts the rows the definition lets through, and a view with no rows answers a count of 0, which still counts as open.
+- `--service-url` is used as typed, with no query string or credentials expected in it. Only the host is printed. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
 
 ## Contributing
 

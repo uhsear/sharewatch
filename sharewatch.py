@@ -23,16 +23,25 @@ first. --verify-host names the host the new portal must be on, and the run is
 refused if the urls, the portal's own portals/self answer or a redirect say
 otherwise. Mirror writes nothing, not even with --apply.
 
+The caps mode is for the minute after a definition update. Hiding a field on a
+public form view can add Query to the layer's capabilities, and Query is what
+lets anyone read the rows. caps re-reads every layer's capabilities, compares
+them with the ones you name in --was, and asks each layer for a row count with
+no token at all. A layer that was not readable before and now answers is
+reported first. caps writes nothing, not even with --apply.
+
     python sharewatch.py --self-test
     python sharewatch.py snapshot --url https://example.maps.arcgis.com --out snaps/ --apply
     python sharewatch.py diff snaps/sharewatch-20260914T060000Z.json snaps/sharewatch-20260915T060000Z.json
     python sharewatch.py watch --url https://example.maps.arcgis.com --dir snaps/ --apply
     python sharewatch.py mirror --old-url https://old.example.org --new-url https://new.example.org --verify-host new.example.org
+    python sharewatch.py caps --service-url https://services.example.org/rest/services/Form_view/FeatureServer --was Create
 
 Exit codes: 0 no differences, 1 anything to read (a narrowing or a deletion is
 a difference too), 2 the portal call failed or a mirror host proof failed, 3 no
 differences found but the read could not prove it (a snapshot cut short, read
-without a token, or empty), 64 usage error.
+without a token, empty, or an anonymous query that gave no usable answer),
+64 usage error.
 """
 
 from __future__ import print_function
@@ -140,6 +149,10 @@ SEVERITY = {
     "mirror-new-public": 30,  # public on the new portal and not on the old at all
     "mirror-new-shared": 28,  # org or group shared on the new portal, absent on the old
     "mirror-ambiguous": 30,   # two items share a title and type, so no pairing
+    # caps: one layer re-read after a definition update, compared with --was.
+    "cap-flip-open": 100,     # an anonymous query got rows from a view that was not readable
+    "cap-added": 70,          # a capability other than Query was added: not probed, it writes
+    "cap-flip": 60,           # Query was added and anonymous reads are not open today
 }
 
 # Kinds whose timestamp is not evidence of when the change happened, so they are
@@ -968,6 +981,100 @@ def share_response_findings(bodies, new):
     return collapse(findings)
 
 
+# ------------------------------------------------- caps: the flip, as a decision
+
+def parse_capabilities(text):
+    """A layer's capabilities as {lower-case name: name as written}, or None.
+
+    The layer description carries them as one comma separated string, such as
+    "Create,Query,Editing". A layer that gives no string at all is None, which
+    is not the same as an empty string: None means the read proved nothing.
+    """
+    if not isinstance(text, str):
+        return None
+    names = [part.strip() for part in text.split(",")]
+    return dict((name.lower(), name) for name in names if name)
+
+
+def probe_verdict(status, body):
+    """Read the answer to an anonymous row count. Returns (state, why).
+
+    "open" is rows (a count) handed to a caller with no token. "closed" is an
+    answer that refused: an HTTP 4xx status, or an error object in the body
+    with a 4xx code, which is how the portal usually refuses with HTTP 200.
+    Everything else is "unknown", and a 5xx is that too: a server error does
+    not prove that the layer is closed, and calling it closed would be a false
+    clean.
+    """
+    if status is not None:
+        return ("closed" if 400 <= status < 500 else "unknown",
+                "HTTP %d" % status)
+    if not isinstance(body, dict):
+        return "unknown", "the answer was not a JSON object"
+    if "error" in body:
+        err = body["error"]
+        code = err.get("code") if isinstance(err, dict) else None
+        if isinstance(code, int) and 400 <= code < 500:
+            return "closed", "error %d" % code
+        return "unknown", "an error answer with code %s" % (code,)
+    count = body.get("count")
+    if isinstance(count, int) and not isinstance(count, bool):
+        return "open", "returned a count of %d" % count
+    return "unknown", "the answer held no count and no error"
+
+
+def capability_findings(layers, was):
+    """Compare each layer's capabilities with --was. Returns (findings, gaps).
+
+    layers: dicts with id, name, capabilities (a string or None) and anon (the
+    (state, why) of an anonymous row count). was: parse_capabilities of what the
+    view held before the definition update.
+
+    The anonymous count decides, not the list: a layer whose capabilities omit
+    Query and still answers an anonymous count is reported, because the answer
+    is the exposure. A layer that already held Query before is not a flip, so
+    an anonymous count that works there is the state it was in, not news.
+    """
+    findings, gaps = [], []
+    already_open = "query" in was
+    was_text = ",".join(was.values())
+    for layer in layers:
+        label = "layer %s (%s)" % (layer["id"], layer["name"])
+        now = parse_capabilities(layer["capabilities"])
+        state, why = layer["anon"]
+        added = {}
+        shown = "not listed"
+        if now is None:
+            gaps.append("%s lists no capabilities" % label)
+        else:
+            added = dict((k, v) for k, v in now.items() if k not in was)
+            shown = ",".join(now.values())
+        if state == "open" and not already_open:
+            findings.append({"kind": "cap-flip-open", "layer": label,
+                             "detail": "an anonymous query %s and this view "
+                                       "was not readable before (was %s, now %s)"
+                                       % (why, was_text, shown)})
+        elif "query" in added:
+            outcome = "was refused" if state == "closed" else "was inconclusive"
+            findings.append({"kind": "cap-flip", "layer": label,
+                             "detail": "Query was added (was %s, now %s) and an "
+                                       "anonymous query %s (%s). Check the "
+                                       "item's sharing before it reaches "
+                                       "Everyone" % (was_text, shown, outcome,
+                                                     why)})
+        elif state == "unknown" and not already_open:
+            gaps.append("%s: the anonymous query was inconclusive (%s)"
+                        % (label, why))
+        extra = [name for key, name in added.items() if key != "query"]
+        if extra:
+            findings.append({"kind": "cap-added", "layer": label,
+                             "detail": "%s added (was %s, now %s). Writes are "
+                                       "never probed here"
+                                       % (",".join(extra), was_text, shown)})
+    findings.sort(key=lambda f: (-SEVERITY[f["kind"]], f["layer"]))
+    return findings, gaps
+
+
 # ---------------------------------------------------------------- portal i/o
 
 def _opener(insecure, pin_host=None):
@@ -996,9 +1103,16 @@ def _call(url, path, params, insecure=False, post=False, secret=None,
     The portal answers HTTP 200 with an error object in the body, so the status
     code proves nothing and the body has to be read every time.
     """
+    endpoint = "%s/sharing/rest/%s" % (url.rstrip("/"), path.lstrip("/"))
+    return _fetch(endpoint, params, insecure, post, secret, pin_host)
+
+
+def _fetch(endpoint, params, insecure=False, post=False, secret=None,
+           pin_host=None):
+    """One call to a full endpoint url: the body of _call, and the way caps
+    reaches a service, whose url does not sit under /sharing/rest."""
     params = dict(params)
     params["f"] = "json"
-    endpoint = "%s/sharing/rest/%s" % (url.rstrip("/"), path.lstrip("/"))
     data = urllib.parse.urlencode(params).encode("utf-8")
     opener = _opener(insecure, pin_host)
     try:
@@ -1171,6 +1285,65 @@ def take_snapshot(url, query, token, insecure=False, echo=None, pin_host=None,
     return build_snapshot(url, taken, items, groups, total, truncated,
                           anonymous=not token,
                           groups_short=listing_short or members_short)
+
+
+def layer_ids(root):
+    """The id of every layer and table a service root lists."""
+    ids = []
+    for key in ("layers", "tables"):
+        for entry in root.get(key) or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), int):
+                raise RuntimeError("the service lists a %s entry with no "
+                                   "numeric id" % key)
+            ids.append(entry["id"])
+    return ids
+
+
+def probe_anonymous(layer_url, insecure=False, pin_host=None):
+    """Ask one layer for a row count with no token at all. Returns (state, why).
+
+    No token and no cookie jar: this is what a stranger sends. A failure to get
+    any usable answer is "unknown", never "closed".
+    """
+    query = urllib.parse.urlencode({"where": "1=1", "returnCountOnly": "true",
+                                    "f": "json"})
+    status, body = None, None
+    try:
+        response = _opener(insecure, pin_host).open(
+            "%s/query?%s" % (layer_url, query), timeout=HTTP_TIMEOUT)
+        body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+    except Exception as exc:
+        return "unknown", "no usable answer (%s)" % type(exc).__name__
+    return probe_verdict(status, body)
+
+
+def read_layers(service_url, token, insecure=False, pin_host=None):
+    """Read each layer's capabilities, then test it anonymously.
+
+    service_url is a FeatureServer root, which lists its layers and tables, or
+    one layer. Returns the dicts capability_findings takes. A portal error on
+    the read raises RuntimeError, with the token redacted.
+    """
+    base = service_url.rstrip("/")
+    params = {"token": token} if token else {}
+    last = base.rsplit("/", 1)[-1]
+    if last.isdigit():
+        base, ids = base.rsplit("/", 1)[0], [int(last)]
+    else:
+        ids = layer_ids(_fetch(base, params, insecure, pin_host=pin_host))
+        if not ids:
+            raise RuntimeError("the service lists no layers and no tables")
+    layers = []
+    for lid in ids:
+        url = "%s/%d" % (base, lid)
+        described = _fetch(url, params, insecure, pin_host=pin_host)
+        layers.append({"id": lid, "name": described.get("name") or "unnamed",
+                       "capabilities": described.get("capabilities"),
+                       "anon": probe_anonymous(url, insecure, pin_host)})
+    return layers
 
 
 def load_snapshot(path):
@@ -2665,6 +2838,7 @@ def _self_test():
             port = self.server.server_address[1]
             self.server.portal.targets.append(self.path)
             for tail, origin in (("/bounce", StubHandler.bounce_to),
+                                 ("/bounce/query", StubHandler.bounce_to),
                                  ("/stay", "http://127.0.0.1:%d" % port)):
                 if path.endswith(tail) or (StubHandler.bounce_all
                                            and tail == "/bounce"):
@@ -3709,6 +3883,388 @@ def _self_test():
           "private to group-only is item-shared, below item-org  "
           "<-- pinned defect")
 
+    # ---- caps: a definition update that adds Query, and the anonymous test
+    #
+    # The decision first, with no server at all.
+    check(parse_capabilities("Create, Query ,Editing")
+          == {"create": "Create", "query": "Query", "editing": "Editing"}
+          and parse_capabilities("QUERY") == {"query": "QUERY"},
+          "capabilities are split on commas, trimmed, and compared without "
+          "case")
+    check(parse_capabilities("") == {} and parse_capabilities(None) is None
+          and parse_capabilities(["Query"]) is None,
+          "no string at all is None, which is not the empty string")
+    for status, body, want, label in (
+            (None, {"count": 12}, "open", "a count is rows handed to a stranger"),
+            (None, {"count": 0}, "open",
+             "a count of zero is still an answer from a readable layer  "
+             "<-- pinned defect"),
+            (None, {"count": True}, "unknown", "a true is not a count"),
+            (None, {"count": "12"}, "unknown", "a string is not a count"),
+            (None, {"error": {"code": 499, "message": "Token Required"}},
+             "closed", "an error object with 499 is closed, HTTP 200 or not"),
+            (None, {"error": {"code": 403}}, "closed", "403 is closed"),
+            (None, {"error": {"code": 500}}, "unknown",
+             "a 500 error object is not proof of a closed layer  "
+             "<-- pinned defect"),
+            (None, {"error": {"code": "499"}}, "unknown",
+             "a code that is not a number proves nothing"),
+            (None, {"error": "Token Required"}, "unknown",
+             "an error that is not an object proves nothing"),
+            (None, {}, "unknown", "an answer with no count and no error"),
+            (None, [1], "unknown", "JSON that is not an object"),
+            (403, None, "closed", "an HTTP 403 is closed"),
+            (503, None, "unknown",
+             "an HTTP 503 is not proof of a closed layer  "
+             "<-- pinned defect")):
+        check(probe_verdict(status, body)[0] == want,
+              "probe: %s" % label)
+    check(probe_verdict(None, {"count": 12})[1] == "returned a count of 12"
+          and probe_verdict(403, None)[1] == "HTTP 403"
+          and "code 500" in probe_verdict(None, {"error": {"code": 500}})[1],
+          "the verdict says why, with the count or the code")
+
+    def lay(caps, anon, lid=0, name="Reports"):
+        return {"id": lid, "name": name, "capabilities": caps, "anon": anon}
+
+    OPEN = ("open", "returned a count of 12")
+    CLOSED = ("closed", "error 499")
+    UNSURE = ("unknown", "HTTP 503")
+    was_create = parse_capabilities("Create")
+    found, gaps = capability_findings([lay("Create,Query", OPEN)], was_create)
+    check([f["kind"] for f in found] == ["cap-flip-open"] and gaps == []
+          and "was Create, now Create,Query" in found[0]["detail"]
+          and "returned a count of 12" in found[0]["detail"],
+          "Query added and an anonymous count that works is the flip, open")
+    found, gaps = capability_findings([lay("Create,Query", CLOSED)], was_create)
+    check([f["kind"] for f in found] == ["cap-flip"] and gaps == []
+          and "was refused" in found[0]["detail"]
+          and SEVERITY["cap-flip"] < SEVERITY["cap-flip-open"],
+          "Query added with anonymous reads refused is a flip, ranked below an "
+          "open one")
+    found, gaps = capability_findings([lay("Create,Query", UNSURE)], was_create)
+    check([f["kind"] for f in found] == ["cap-flip"] and gaps == []
+          and "was inconclusive" in found[0]["detail"]
+          and "HTTP 503" in found[0]["detail"],
+          "Query added and an anonymous count that gave no answer is still "
+          "reported, as inconclusive  <-- pinned defect")
+    check(capability_findings([lay("Create", CLOSED)], was_create)
+          == ([], []),
+          "capabilities as they were and a closed layer are a clean result")
+    found, gaps = capability_findings([lay("Create", OPEN)], was_create)
+    check([f["kind"] for f in found] == ["cap-flip-open"]
+          and "now Create)" in found[0]["detail"],
+          "a layer that does not list Query and answers an anonymous count is "
+          "reported, because the answer is the exposure  <-- pinned defect")
+    check(capability_findings([lay("Query,Create", OPEN)],
+                              parse_capabilities("create,QUERY"))
+          == ([], []),
+          "a view that was readable before is not a flip when it still is, "
+          "whatever the case of the names  <-- pinned defect")
+    check(capability_findings([lay("Query", UNSURE)],
+                              parse_capabilities("Query")) == ([], []),
+          "a view that was readable before has no flip to prove, so an "
+          "inconclusive count is not a gap")
+    found, gaps = capability_findings([lay("Create", UNSURE)], was_create)
+    check(found == [] and len(gaps) == 1 and "inconclusive" in gaps[0],
+          "no flip found by a count that gave no answer is a gap, not a clean "
+          "result  <-- pinned defect")
+    found, gaps = capability_findings([lay(None, CLOSED)], was_create)
+    check(found == [] and gaps == ["layer 0 (Reports) lists no capabilities"],
+          "a layer that lists no capabilities is a gap")
+    found, gaps = capability_findings([lay(None, OPEN)], was_create)
+    check([f["kind"] for f in found] == ["cap-flip-open"]
+          and "now not listed" in found[0]["detail"] and len(gaps) == 1,
+          "an open layer with no capabilities listed is reported, and still a "
+          "gap")
+    found, gaps = capability_findings([lay("Create,Update,Editing", CLOSED)],
+                                      was_create)
+    check([f["kind"] for f in found] == ["cap-added"]
+          and "Update,Editing added" in found[0]["detail"]
+          and "never probed" in found[0]["detail"],
+          "a capability other than Query that was added is reported, and says "
+          "that writes are never probed")
+    found, gaps = capability_findings(
+        [lay("Create,Delete", CLOSED, 2, "C"),
+         lay("Create", CLOSED, 0, "A"),
+         lay("Create,Query,Update", OPEN, 1, "B")], was_create)
+    check([f["kind"] for f in found] == ["cap-flip-open", "cap-added", "cap-added"]
+          and found[1]["layer"] < found[2]["layer"],
+          "findings are ranked worst first and then by layer, with several "
+          "layers read")
+
+    # The service, over a real socket. Every answer is the stub's own and none
+    # of it is an Esri response: the stub states what the server is made to say.
+    class FakeService(FakePortal):
+        """A feature service: a root that lists layers and tables, a
+        description per layer and a count query. A layer says what a stranger's
+        count gets back with anon_count: a number, or None for a refusal. A
+        service that is not public refuses every call with no token."""
+
+        def __init__(self, layers, public=True, anon_answer=None, **kw):
+            FakePortal.__init__(self, **kw)
+            self.layers = layers
+            self.public = public
+            self.anon_answer = anon_answer
+
+        def _body(self, path, params):
+            if "/FeatureServer" not in path:
+                return FakePortal._body(self, path, params)
+            anonymous = params.get("token") != self.token
+            if anonymous and not self.public:
+                return {"error": {"code": 499, "message": "Token Required"}}
+            tail = path.split("/FeatureServer", 1)[1].strip("/")
+            if not tail:
+                return {"layers": [{"id": i, "name": spec.get("name")}
+                                   for i, spec in sorted(self.layers.items())
+                                   if not spec.get("table")],
+                        "tables": [{"id": i, "name": spec.get("name")}
+                                   for i, spec in sorted(self.layers.items())
+                                   if spec.get("table")]}
+            lid, _slash, rest = tail.partition("/")
+            spec = self.layers.get(int(lid))
+            if spec is None:
+                return {"error": {"code": 400, "message": "no such layer"}}
+            if not rest:
+                described = {"id": int(lid)}
+                if spec.get("name"):
+                    described["name"] = spec["name"]
+                if spec.get("capabilities") is not None:
+                    described["capabilities"] = spec["capabilities"]
+                return described
+            if anonymous and self.anon_answer is not None:
+                return self.anon_answer
+            if anonymous and spec.get("anon_count") is None:
+                return {"error": {"code": 403, "message": "You do not have "
+                                  "permissions to access this resource or "
+                                  "perform this operation."}}
+            return {"count": spec.get("anon_count", 3)}
+
+    def run_caps(service, was="Create", extra=(), token="TESTTOKEN",
+                 path="/rest/services/Form_view/FeatureServer",
+                 encoding="utf-8"):
+        with listening(service) as (port,):
+            argv = ["caps", "--service-url", "http://127.0.0.1:%d%s" % (port, path),
+                    "--was", was] + [x.replace("{port}", str(port))
+                                     for x in extra]
+            if token:
+                with env_set(TOKEN_ENV, token):
+                    return captured(lambda: main(argv), encoding)
+            return captured(lambda: main(argv), encoding)
+
+    form_view = FakeService({0: {"name": "Reports", "capabilities": "Create,Query",
+                                  "anon_count": 12}})
+    code, seen = run_caps(form_view)
+    check(code == 1 and "[100] cap-flip-open" in seen
+          and "layer 0 (Reports)" in seen
+          and "returned a count of 12" in seen
+          and "was Create, now Create,Query" in seen,
+          "caps reports the flip that opens anonymous reads, worst first, "
+          "with exit 1")
+    reads = [t for t in form_view.targets if "/query" not in t]
+    asks = [t for t in form_view.targets if "/query" in t]
+    check(len(reads) == 2 and all("token=TESTTOKEN" in t for t in reads)
+          and len(asks) == 1 and "token" not in asks[0]
+          and "returnCountOnly=true" in asks[0] and "where=1%3D1" in asks[0],
+          "the capabilities are read with the token and the count is asked "
+          "with no token at all  <-- pinned defect")
+    check(form_view.posted == [] and "TESTTOKEN" not in seen
+          and all(t.startswith("/rest/services/Form_view/FeatureServer")
+                  for t in form_view.targets),
+          "caps sends no POST, only the service's own paths, and prints no "
+          "token")
+
+    private_view = FakeService({0: {"name": "Reports",
+                                     "capabilities": "Create,Query"}},
+                               public=False)
+    code, seen = run_caps(private_view)
+    check(code == 1 and "[ 60] cap-flip " in seen and "was refused" in seen
+          and "(error 499)" in seen and "Check the item's sharing" in seen,
+          "Query added to a view a stranger cannot read yet is a flip, ranked "
+          "60, with exit 1")
+
+    quiet_view = FakeService({0: {"name": "Reports", "capabilities": "Create"}})
+    code, seen = run_caps(quiet_view)
+    check(code == 0 and "No capability flip" in seen and "[" not in seen,
+          "capabilities as they were and a refused count exit 0 with the clean "
+          "sentence")
+    readable_view = FakeService({0: {"name": "Reports",
+                                      "capabilities": "Query,Create",
+                                      "anon_count": 5}})
+    code, seen = run_caps(readable_view, was="query,create")
+    check(code == 0 and "No capability flip" in seen,
+          "a view that was readable before and is now is not reported  "
+          "<-- pinned defect")
+    unlisted_view = FakeService({0: {"name": "Reports", "capabilities": "Create",
+                                      "anon_count": 8}})
+    code, seen = run_caps(unlisted_view)
+    check(code == 1 and "cap-flip-open" in seen and "now Create)" in seen,
+          "a layer that does not list Query and answers a stranger is "
+          "reported  <-- pinned defect")
+    flaky_view = FakeService({0: {"name": "Reports", "capabilities": "Create"}},
+                             anon_answer={"error": {"code": 500,
+                                                    "message": "boom"}})
+    code, seen = run_caps(flaky_view)
+    check(code == 3 and "Cannot tell whether anything changed" in seen
+          and "inconclusive" in seen and "code 500" in seen,
+          "a count the server failed to answer is exit 3, not a clean 0  "
+          "<-- pinned defect")
+    mixed_view = FakeService({0: {"name": "Reports", "capabilities": "Create"},
+                              1: {"name": "Notes", "capabilities": "Create,Query",
+                                  "anon_count": 1}},
+                             anon_answer=None)
+    code, seen = run_caps(mixed_view)
+    check(code == 1 and "layer 1 (Notes)" in seen and "layer 0" not in seen,
+          "only the layer that flipped is named when the other one did not")
+    mixed_gap = FakeService({0: {"name": "Reports", "capabilities": None},
+                             1: {"name": "Notes", "capabilities": "Create,Query",
+                                 "anon_count": 1}})
+    code, seen = run_caps(mixed_gap)
+    check(code == 1 and "Also cannot tell: layer 0 (Reports) lists no "
+          "capabilities." in seen,
+          "a flip on one layer does not hide that another could not be read")
+    nameless = FakeService({0: {"capabilities": None}})
+    code, seen = run_caps(nameless)
+    check(code == 3 and "layer 0 (unnamed) lists no capabilities" in seen,
+          "a layer with no capabilities and no name is exit 3 and says so")
+    code, seen = run_caps(FakeService({0: {"name": "Edits",
+                                            "capabilities": "Create,Update,Editing"}}))
+    check(code == 1 and "[ 70] cap-added" in seen,
+          "a capability other than Query that was added exits 1")
+    wide = FakeService({0: {"name": "Snow \u2603", "capabilities": "Create,Query",
+                            "anon_count": 1}})
+    code, seen = run_caps(wide, encoding="cp1252")
+    check(code == 1 and "Snow ?" in seen,
+          "a layer name the console cannot encode is replaced and the finding "
+          "still prints")
+
+    # the url forms and the other layers a service can hold
+    one_layer = FakeService({0: {"name": "Reports", "capabilities": "Create"},
+                             1: {"name": "Other", "capabilities": "Create,Query",
+                                 "anon_count": 1}})
+    code, seen = run_caps(one_layer, path="/rest/services/Form_view/FeatureServer/0")
+    check(code == 0 and "read 1 layer(s)" in seen
+          and not any("FeatureServer/1" in t or "FeatureServer?" in t
+                          for t in one_layer.targets),
+          "a url that names one layer reads that layer only, and not the root "
+          "or its neighbour")
+    with_table = FakeService({0: {"name": "Reports", "capabilities": "Create"},
+                              5: {"name": "Log", "table": True,
+                                  "capabilities": "Create,Query",
+                                  "anon_count": 2}})
+    code, seen = run_caps(with_table)
+    check(code == 1 and "layer 5 (Log)" in seen and "read 2 layer(s)" in seen,
+          "a table in the service is read and tested like a layer  "
+          "<-- pinned defect")
+    code, seen = run_caps(FakeService({0: {"name": "R", "capabilities": "Create"}}),
+                          path="/rest/services/Form_view/FeatureServer/7")
+    check(code == 2 and "400 no such layer" in seen,
+          "a layer url the service does not have is an error, not a clean read")
+    code, seen = run_caps(FakeService({}))
+    check(code == 2 and "lists no layers and no tables" in seen,
+          "a service that lists nothing is an error, not a clean read")
+    broken_root = FakeService({}, anon_answer=None)
+    broken_root._body = lambda path, params: {"layers": [{"name": "x"}]}
+    code, seen = run_caps(broken_root)
+    check(code == 2 and "no numeric id" in seen,
+          "a layer entry with no id is an error, not a skipped layer  "
+          "<-- pinned defect")
+    code, seen = run_caps(FakeService({0: {"name": "R", "capabilities": "Create"}},
+                                      public=False), token=None)
+    check(code == 2 and "499 Token Required" in seen,
+          "a service that refuses the read is exit 2 with the portal's refusal")
+    code, seen = run_caps(FakeService({0: {"name": "R", "capabilities": "Create"}}),
+                          token=None)
+    check(code == 0 and "WARNING: no token" in seen,
+          "a read with no token says what it can see")
+
+    # sign-in through the portal named by --url, with the password off argv
+    with_login = FakeService({0: {"name": "R", "capabilities": "Create,Query",
+                                   "anon_count": 4}})
+    with env_set(SECRET_ENV, "hunter2"):
+        code, seen = run_caps(with_login, token=None,
+                              extra=["--url", "http://127.0.0.1:{port}",
+                                     "--username", "someone"])
+    check(code == 1 and "cap-flip-open" in seen and "hunter2" not in seen
+          and "TESTTOKEN" not in seen and len(with_login.posted) == 1
+          and "generateToken" in with_login.targets[0],
+          "--username signs in through --url, the only POST is the sign-in, "
+          "and neither secret is printed")
+
+    # the redirect pin holds for the capabilities read and for the count
+    home_service = FakeService({0: {"name": "R", "capabilities": "Create"}})
+    far_service = FakeService({0: {"name": "R", "capabilities": "Create"}})
+    with listening(far_service, home_service,
+                   hosts=["127.0.0.1", "127.0.0.2"]) as (pp, pq):
+        StubHandler.bounce_to = "http://127.0.0.2:%d" % pq
+        with env_set(TOKEN_ENV, "SECRETTOK"):
+            code, seen = captured(lambda: main(
+                ["caps", "--service-url", "http://127.0.0.1:%d/x/bounce" % pp,
+                 "--was", "Create"]))
+        check(code == 2 and "leaves the verified host" in seen
+              and "SECRETTOK" not in seen and home_service.targets == [],
+              "a capabilities read refuses a redirect to another host and "
+              "sends it no token  <-- pinned defect")
+        verdict = probe_anonymous("http://127.0.0.1:%d/x/bounce" % pp,
+                                  pin_host="127.0.0.1")
+        check(verdict == ("unknown", "no usable answer (URLError)")
+              and home_service.targets == [],
+              "the anonymous count refuses a redirect to another host too, "
+              "and that is unknown, not closed  <-- pinned defect")
+
+    # the failures of the count itself, in process
+    def probing(opener):
+        return serving(opener, lambda: probe_anonymous("https://h/x/FeatureServer/0"))
+
+    def http_error(code):
+        return lambda target: urllib.error.HTTPError(target, code, "x", {},
+                                                     io.BytesIO(b""))
+
+    check(probing(FakeService({}, open_error=http_error(403)))[0] == "closed",
+          "a real HTTP 403 status is closed")
+    check(probing(FakeService({}, open_error=http_error(503)))[0] == "unknown",
+          "a real HTTP 503 status is unknown  <-- pinned defect")
+    check(probing(FakeService({}, open_error=lambda t: OSError("down")))
+          == ("unknown", "no usable answer (OSError)"),
+          "no connection is unknown, and the message carries no url")
+
+    class RawOpener(object):
+        def __call__(self, insecure, pin_host=None):
+            return self
+
+        def open(self, target, data=None, timeout=None):
+            return io.BytesIO(b"<html>maintenance</html>")
+
+    check(probing(RawOpener())
+          == ("unknown", "no usable answer (JSONDecodeError)"),
+          "an html page where the count should be is unknown, not open or "
+          "closed  <-- pinned defect")
+
+    # usage
+    for argv, text, label in (
+            (["caps", "--was", "Create"], "--service-url is required",
+             "caps with no --service-url"),
+            (["caps", "--service-url", "https://h/x/FeatureServer"],
+             "--was is required", "caps with no --was"),
+            (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
+              ",  ,"], "at least one capability", "an empty --was"),
+            (["caps", "--service-url", "h/x/FeatureServer", "--was", "Create"],
+             "must start with https://", "a scheme-less --service-url"),
+            (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
+              "Create", "--apply"], "writes nothing", "--apply on caps"),
+            (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
+              "Create", "--username", "u"], "--username needs --url",
+             "--username with no portal"),
+            (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
+              "Create", "--username", "u", "--url", "https://p",
+              "--insecure"], "--insecure with --username",
+             "--insecure with --username")):
+        code, seen = captured(lambda: main(argv))
+        check(code == 64 and text in seen, "%s is a usage error" % label)
+    refuses(["caps", "--ap"], "a prefix of --apply is refused on caps too  "
+            "<-- pinned defect")
+    refuses(["caps", "--serv", "x"], "a prefix of --service-url is refused")
+
     real_self_test = globals()["self_test"]
     globals()["self_test"] = lambda: 7
     try:
@@ -3798,13 +4354,18 @@ def _parse(argv):
                "token is never a flag: export %s or %s, or answer the prompt."
                % (SECRET_ENV, TOKEN_ENV),
     )
-    ap.add_argument("mode", nargs="?", choices=["snapshot", "diff", "watch", "mirror"],
+    ap.add_argument("mode", nargs="?",
+                    choices=["snapshot", "diff", "watch", "mirror", "caps"],
                     help="snapshot writes one, diff compares two, watch takes a "
                          "fresh one and compares it with the newest in --dir, "
-                         "mirror compares two portals and writes nothing")
+                         "mirror compares two portals and writes nothing, caps "
+                         "re-reads a view's capabilities and tests it "
+                         "anonymously and writes nothing")
     ap.add_argument("paths", nargs="*", default=[],
                     help="for diff: the older snapshot then the newer one")
-    ap.add_argument("--url", help="portal url, e.g. https://example.maps.arcgis.com")
+    ap.add_argument("--url", help="portal url, e.g. https://example.maps.arcgis.com"
+                                  ". For caps, only the portal that signs "
+                                  "--username in")
     ap.add_argument("--query",
                     help="search query (default: orgid of the signed-in org)")
     ap.add_argument("--username",
@@ -3835,6 +4396,11 @@ def _parse(argv):
     ap.add_argument("--responses",
                     help="mirror: a JSON file of share-call responses saved by "
                          "the migration script, checked for notSharedWith")
+    ap.add_argument("--service-url", dest="service_url",
+                    help="caps: the FeatureServer url of the view, or of one "
+                         "layer, including https://")
+    ap.add_argument("--was", help="caps: the capabilities the view held before "
+                                  "the definition update, such as Create")
     ap.add_argument("--out", help="directory to write the snapshot into")
     ap.add_argument("--dir", help="directory of snapshots, for watch")
     ap.add_argument("--window-minutes", dest="window_minutes", type=int,
@@ -4095,6 +4661,64 @@ def _mirror(args):
     return exit_code(events, bool(gaps))
 
 
+def _caps(args):
+    """Re-read a view's capabilities and test it anonymously. Writes nothing.
+
+    Exit 1 for a flip or an added capability, 3 when nothing was found but a
+    layer could not be proved, 2 when a call failed, 0 when every layer is as
+    --was says and no layer that was closed answers a stranger.
+    """
+    for flag in ("service_url", "was"):
+        if not getattr(args, flag):
+            print("error: --%s is required for caps." % flag.replace("_", "-"),
+                  file=sys.stderr)
+            return 64
+    if args.apply:
+        print("error: caps writes nothing, so --apply has no meaning here.",
+              file=sys.stderr)
+        return 64
+    if args.username and not is_http_url(args.url):
+        print("error: --username needs --url, the portal that signs the token "
+              "in, starting with https:// or http://.", file=sys.stderr)
+        return 64
+    if not is_http_url(args.service_url):
+        print("error: --service-url must start with https:// or http://, got "
+              "%r." % args.service_url, file=sys.stderr)
+        return 64
+    was = parse_capabilities(args.was)
+    if not was:
+        print("error: --was has to name at least one capability, such as "
+              "Create.", file=sys.stderr)
+        return 64
+    host = host_of(args.service_url)
+    try:
+        token = _sign_in(args.url, args.username, args.insecure,
+                         pin_host=host_of(args.url))
+        layers = read_layers(args.service_url, token, args.insecure, host)
+    except RuntimeError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    print("read %d layer(s) on host %s" % (len(layers), host))
+    if not token:
+        print("WARNING: no token, so the capabilities are what a stranger is "
+              "shown.")
+    print("-" * 68)
+    findings, gaps = capability_findings(layers, was)
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not findings:
+        print(printable(verdict_text(
+            gaps, "No capability flip: no layer gained a capability beyond "
+                  "--was, and no layer that was not readable before answers an "
+                  "anonymous query."), encoding))
+    for found in findings:
+        print(printable("[%3d] %-14s %s: %s" % (
+            SEVERITY[found["kind"]], found["kind"], found["layer"],
+            found["detail"]), encoding))
+    if findings and gaps:
+        print(printable("Also cannot tell: %s." % "; ".join(gaps), encoding))
+    return exit_code(findings, bool(gaps))
+
+
 def main(argv=None):
     """Run one command. Every way out is an exit code a scheduler can read.
 
@@ -4118,7 +4742,7 @@ def _run(args):
         return self_test()
 
     if not args.mode:
-        print("error: a mode is required: snapshot, diff, watch or mirror. Use "
+        print("error: a mode is required: snapshot, diff, watch, mirror or caps. Use "
               "--self-test to verify the tool without a portal.", file=sys.stderr)
         return 64
     if args.window_minutes < 0:
@@ -4133,6 +4757,9 @@ def _run(args):
 
     if args.mode == "mirror":
         return _mirror(args)
+
+    if args.mode == "caps":
+        return _caps(args)
 
     if args.mode == "diff":
         if len(args.paths) != 2:
