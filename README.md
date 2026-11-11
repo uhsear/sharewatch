@@ -443,7 +443,8 @@ plausible-looking `--unshare` is rejected rather than ignored. It asserts the sa
 against the socket stub: every request it made was one of the three read paths, and the only POST
 is the sign-in.
 
-`caps` sends GET requests only: the service root, each layer, and one `query` per layer. The
+`caps` sends GET requests only: the service root, each layer, and one `query` per layer. The one
+exception is the `generateToken` POST that `--url` with `--username` adds. The
 self-test asserts that it sends no POST when a token is in the environment, that every path it
 asked for is under the service url, and that the `query` request carries no token.
 
@@ -616,6 +617,14 @@ More limits, each one a sentence:
 - A snapshot file takes the process's default permissions and holds item titles, owners and sharing levels for the whole org, so keep `--out` in a restricted folder.
 - Two `--apply` runs in the same second write the same file name, and the second overwrites the first.
 - The redirect pin and the host comparison ignore the port and the scheme in `caps` and `snapshot`, as they do in `mirror`.
+- The before state is typed by hand in `--was`, so `caps` never records it. A wrong or incomplete `--was` gives a wrong comparison.
+- A `--was` that leaves out a capability the view already held, such as Editing listed beside Create, is reported as `cap-added` and exits 1.
+- A layer that answers a stranger with an error code outside 401, 403, 498 and 499 exits 3, because the tool cannot tell closed from broken. A Create-only view that is not readable may therefore exit 3 with nothing flipped. Which code Esri returns there was not checked offline.
+- `caps` ignores flags that belong to other modes, such as `--dir`, `--out` and `--query`, and `--url` without `--username`, without a word.
+- `.gitignore` does not exclude `sharewatch-*.json`. A snapshot holds item titles, owners and sharing levels for the whole org, so keep `--out` outside any repository.
+- A snapshot taken with a token that is not an administrator's holds only the items and groups that account can see. It is not marked incomplete and the run exits 0, so use an administrator token for `snapshot` and `watch` as well as `mirror`.
+- Portal error messages are printed to standard error as the portal returns them, control characters included, as item titles are.
+- `redact()` matches the raw, `quote_plus` and `quote` forms of a secret only. A server that echoes a token in another encoding, such as HTML entities, is not redacted.
 
 ## Contributing
 
