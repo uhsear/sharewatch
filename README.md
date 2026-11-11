@@ -394,7 +394,7 @@ The count decides, and the list is the evidence. A layer that did not hold `Quer
 a stranger with a count is the flip, whatever its capabilities say.
 
 A real run against a local `http.server` stub holding synthetic data. Layer 0 gained `Query`, layer
-1 did not change, and layer 2 gained `Update`. The stub is not shipped. The self-test has its own
+1 did not change, and layer 2 gained `Update` and `Editing`. The stub is not shipped. The self-test has its own
 fixtures and a run against them, so you cannot regenerate this exact block from the repository:
 
 ```
@@ -419,7 +419,7 @@ How it reads the anonymous count:
 - Anything else is unknown. That covers any other 4xx (such as 404, 407, 408 and 429), a 5xx, a timeout, a refused connection, a page that is not
   JSON and a 200 with neither a count nor an error. Unknown is never called closed. If `Query` was
   added, the finding says the count was inconclusive. If nothing was found, the run exits 3.
-- A view whose `--was` already held `Query` is never a flip. Its count works because it did before.
+- A view whose `--was` already held `Query` is never reported as a flip. One `--was` serves every layer, so a layer that answers a stranger under it may have been readable before or may have just opened. The run cannot tell which, names the layer as something it cannot tell, and exits 3 when it found nothing else.
 
 The refusal in the stub comes both ways: an HTTP 403 status in process, and an error object with
 HTTP 200 over the socket. Esri's REST reference does not say which one a layer uses for a stranger.
@@ -717,7 +717,7 @@ More limits, each one a sentence:
 - Text read from a `--responses` file, and the `unexpected <Type>` line, are printed as written. Remove tokens from saved responses before you pass them in.
 - The `--username` path was tested only against a stub that does not check the `Referer` header, and it was not run against a live portal. A portal that rejects a referer-bound token arriving without a `Referer` header would show as exit 2, not as a false clean.
 - An HTTP 403 from a proxy or firewall in front of the service is read as a refusal by the service. A layer can then be called closed when the gateway, not the service, refused the stranger, and `caps` exits 0 for a layer that is readable by a browser the gateway lets through.
-- `caps` applies one `--was` to every layer. A `--was` containing `Query` silences the open-count finding on every layer, so when the layers of one service held different capabilities, run `caps` once per layer url. A run with such a `--was` prints a `Note:` line that names each layer whose open count it took as old news, and its exit code is unchanged.
+- `caps` applies one `--was` to every layer. A `--was` containing `Query` cannot say which layer was readable before, so every layer that answers a stranger is listed as something the run cannot tell, and the run exits 3 when it found nothing else. A public service that always held `Query` therefore never exits 0 under that `--was`. To get a clean result for a Create-only layer, run `caps` on that layer's url with its own `--was`.
 - `diff` does not check that its two snapshots came from the same portal url. Two portals in one `watch --dir` give a false diff with exit 1.
 - That an organization content report is a CSV with one row per item including its access is not cited here and was not exercised. Neither were the ArcGIS Enterprise portal logs or the ArcGIS Online activity report.
 - On a public Create-only view whose anonymous query Esri answers with an error code other than 401, 403, 498 or 499, `caps` exits 3 on every run until that code is known. This is the safe direction. The code Esri returns for a Create-only view was not checked against Esri documentation, so a routine clean run may never exit 0.
@@ -728,6 +728,13 @@ More limits, each one a sentence:
 - A group row with no `id` would put `None` in the group map and end the run with exit 2 at the sort. Esri sends an id for every group, and this was not run.
 - The Esri quotes were checked against Esri's pages: the activity report text "a log of all activity in your organization for a specified time period" ([report fields][aoreport]), the `capabilities` example string, the `Query` requirement and the `returnCountOnly` count ([feature layer][layerref], [query][queryref]). The organization content report and the Enterprise portal logs were not exercised.
 - The Microsoft claim about `GetConsoleMode` is from https://learn.microsoft.com/en-us/windows/console/getconsolemode.
+- The HTTP-status refusals of `caps` (401, 403, 404 and 503) are exercised in process with a synthetic `HTTPError`, not over a socket. Over a socket the self-test tests only HTTP 200 answers.
+- In the `caps` sample block, layer 2 gained both `Update` and `Editing`.
+- A layer that returns an empty `capabilities` string is treated as listing no capability, not as unreadable. With a refused anonymous count, that layer is clean and the run can exit 0.
+- `caps` sends the token to whatever host `--service-url` names, so point it only at a service you trust with that token.
+- A proxy or WAF that refuses the default Python `urllib` user agent with HTTP 403 makes the anonymous probe read as closed where a browser would get rows. `caps` can then report a clean result for a layer that is open to browsers.
+- `--was` is split on commas only, so `Create;Query` becomes one unknown capability name. The effect is a loud false alarm, never a false clean.
+- Extra positional words are silently ignored by `snapshot`, `watch`, `mirror` and `caps`, so a mistyped word is not reported. The word is not echoed.
 
 ## Contributing
 

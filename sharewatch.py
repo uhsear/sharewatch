@@ -1123,12 +1123,12 @@ def capability_findings(layers, was):
 
 
 def assumed_open(layers, was):
-    """Labels of the layers whose open anonymous count was taken as old news.
+    """Labels of the layers whose open anonymous count cannot be judged new.
 
-    --was is one list for the whole service. When it holds Query, every layer
-    that answers a stranger is treated as readable before, so a layer that was
-    Create-only and has just opened would read clean. The run names those
-    layers so the reader can check them one by one.
+    --was is one list for the whole service. When it holds Query, a layer that
+    answers a stranger may have been readable before or may have just opened,
+    and the list cannot say which. _caps reports these layers as a gap, so the
+    run exits 3 and never reads clean.
     """
     if "query" not in was:
         return []
@@ -4366,7 +4366,7 @@ def _self_test():
           == ["layer 0 (A)"]
           and assumed_open([lay("Query", OPEN)], was_create) == [],
           "only a layer that answers a stranger under a --was with Query is "
-          "named as taken for old news; a --was with no Query names none  "
+          "named as one the run cannot judge; a --was with no Query names none  "
           "<-- pinned defect")
 
     # The service, over a real socket. Every answer is the stub's own and none
@@ -4468,15 +4468,16 @@ def _self_test():
                                       "capabilities": "Query,Create",
                                       "anon_count": 5}})
     code, seen = run_caps(readable_view, was="query,create")
-    check(code == 0 and "No capability flip" in seen,
-          "a view that was readable before and is now is not reported  "
-          "<-- pinned defect")
-    check("Note: --was holds Query for every layer" in seen
-          and "layer 0 (Reports)" in seen.split("Note:")[1],
-          "a run that took an open layer as old news says so and names it, "
-          "because one --was serves every layer  <-- pinned defect")
-    check("Note:" not in run_caps(quiet_view)[1],
-          "a run with no open layer prints no note")
+    check(code == 3 and "[" not in seen
+          and "Cannot tell whether anything changed" in seen
+          and "layer 0 (Reports)" in seen,
+          "a layer that answers a stranger under a --was with Query is not "
+          "called clean: one --was serves every layer, so the run cannot tell "
+          "whether it was readable before and exits 3  <-- pinned defect")
+    check("No capability flip" not in seen and "cannot be told" in seen,
+          "the run that cannot tell prints no clean sentence")
+    check("cannot be told" not in run_caps(quiet_view)[1],
+          "a run with no open layer prints no gap about --was")
     unlisted_view = FakeService({0: {"name": "Reports", "capabilities": "Create",
                                       "anon_count": 8}})
     code, seen = run_caps(unlisted_view)
@@ -5097,8 +5098,9 @@ def _caps(args):
     """Re-read a view's capabilities and test it anonymously. Writes nothing.
 
     Exit 1 for a flip or an added capability, 3 when nothing was found but a
-    layer could not be proved, 2 when a call failed, 0 when every layer is as
-    --was says and no layer that was closed answers a stranger.
+    layer could not be proved (an open layer under a --was with Query counts),
+    2 when a call failed, 0 when every layer is as --was says and no layer that
+    was closed answers a stranger.
     """
     for flag in ("service_url", "was"):
         if not getattr(args, flag):
@@ -5140,6 +5142,14 @@ def _caps(args):
               "shown.")
     print("-" * 68)
     findings, gaps = capability_findings(layers, was)
+    assumed = assumed_open(layers, was)
+    if assumed:
+        # --was is one list for the whole service. A layer that answers a
+        # stranger under a --was with Query may have been Create-only before,
+        # and the run cannot tell, so a quiet result is exit 3, never 0.
+        gaps.append("--was holds Query for every layer, so whether %s was "
+                    "readable before cannot be told. Run caps on each layer's "
+                    "url with its own --was" % ", ".join(assumed))
     encoding = getattr(sys.stdout, "encoding", None)
     if not findings:
         print(printable(verdict_text(
@@ -5152,13 +5162,6 @@ def _caps(args):
             found["detail"]), encoding))
     if findings and gaps:
         print(printable("Also cannot tell: %s." % "; ".join(gaps), encoding))
-    assumed = assumed_open(layers, was)
-    if assumed:
-        print(printable(
-            "Note: --was holds Query for every layer, so an anonymous count "
-            "that works on %s is taken as the state before. If one of them "
-            "was Create-only, run caps on that layer's url with its own --was."
-            % ", ".join(assumed), encoding))
     return exit_code(findings, bool(gaps))
 
 
