@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Diff an ArcGIS organization's sharing posture against yesterday, and report what widened.
 
-ArcGIS Online keeps no sharing audit log. When an internal layer turns up public,
-the portal can tell you that it is public right now and nothing else: not when it
-changed, not who changed it, not what else moved at the same time. The item's
-modified date is the only trace, and the next edit overwrites it.
+When an internal layer turns up public, the portal's item will tell you that it is
+public right now, and its modified date, which the next edit overwrites. It does not
+hand you yesterday's picture or what else moved at the same time. ArcGIS Online has an
+activity report you can download for a period; this tool does not read it.
 
 This writes a snapshot of every item's access, every item's group membership and
 every group's membershipAccess, then compares two snapshots and ranks what
@@ -1487,9 +1487,31 @@ def _scrubbed_environment(prefix="SHAREWATCH_"):
         os.environ.update(saved)
 
 
+@contextlib.contextmanager
+def _loopback_direct():
+    """Keep loopback stub traffic off any proxy named in the environment.
+
+    The self-test talks to http.server stubs on 127.0.0.1. With HTTP_PROXY set
+    and no NO_PROXY, urllib sent those requests to the proxy and the run
+    stopped midway. Production requests keep honouring the proxy variables.
+    """
+    names = ("NO_PROXY", "no_proxy")
+    saved = dict((k, os.environ.get(k)) for k in names)
+    for name in names:
+        os.environ[name] = "127.0.0.1,127.0.0.2,localhost"
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)   # Windows folds the two names
+            else:
+                os.environ[name] = value
+
+
 def self_test():
     """Run the assertions with the operator's credentials out of the way."""
-    with _scrubbed_environment():
+    with _scrubbed_environment(), _loopback_direct():
         return _self_test()
 
 
@@ -3671,6 +3693,26 @@ def _self_test():
     check(hidden_away and kept,
           "the self-test hides the operator's SHAREWATCH_ variables and puts "
           "them back  <-- pinned defect")
+    kept_proxy = dict((k, os.environ.pop(k, None))
+                      for k in ("NO_PROXY", "no_proxy", "HTTP_PROXY",
+                                "http_proxy"))
+    os.environ["HTTP_PROXY"] = "http://127.0.0.1:9"
+    try:
+        with _loopback_direct():
+            direct = urllib.request.proxy_bypass_environment("127.0.0.1")
+        gone = "NO_PROXY" not in os.environ and "no_proxy" not in os.environ
+        os.environ["NO_PROXY"] = "corp.example"
+        with _loopback_direct():
+            inside = os.environ["NO_PROXY"]
+        back = os.environ["NO_PROXY"] == "corp.example"
+    finally:
+        for name in ("NO_PROXY", "no_proxy", "HTTP_PROXY", "http_proxy"):
+            os.environ.pop(name, None)
+        os.environ.update(dict((k, v) for k, v in kept_proxy.items()
+                               if v is not None))
+    check(direct and gone and "127.0.0.1" in inside and back,
+          "loopback stub traffic bypasses an HTTP_PROXY, and the operator's "
+          "NO_PROXY is put back  <-- pinned defect")
     code, seen = run_mirror(*quiet_pair())
     check(code == 3 and "read without a token" in seen
           and "WARNING: no token" in seen
@@ -4553,6 +4595,15 @@ def _self_test():
             (["caps", "--service-url", "h/x/FeatureServer", "--was", "Create"],
              "must start with https://", "a scheme-less --service-url"),
             (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
+              "Create Query"], "comma-separated list",
+             "a space-separated --was"),
+            (["caps", "--service-url", "https://h/x/FeatureServer?f=json",
+              "--was", "Create"], "no query string",
+             "a --service-url with a query string"),
+            (["caps", "--service-url", "https://h/x/FeatureServer#top",
+              "--was", "Create"], "no query string",
+             "a --service-url with a fragment"),
+            (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
               "Create", "--apply"], "writes nothing", "--apply on caps"),
             (["caps", "--service-url", "https://h/x/FeatureServer", "--was",
               "Create", "--username", "u"], "--username needs --url",
@@ -4563,6 +4614,15 @@ def _self_test():
              "--insecure with --username")):
         code, seen = captured(lambda: main(argv))
         check(code == 64 and text in seen, "%s is a usage error" % label)
+    code, seen = captured(lambda: main(
+        ["caps", "--service-url", "https://h/x/FeatureServer", "--was",
+         "Create Query"]))
+    code2, seen2 = captured(lambda: main(
+        ["caps", "--service-url", "https://h/x/FeatureServer?f=json",
+         "--was", "Create"]))
+    check(code == 64 and code2 == 64 and "error:" in seen and "error:" in seen2,
+          "a --was with a space and a --service-url with a query string are "
+          "refused before any request  <-- pinned defect")
     refuses(["caps", "--ap"], "a prefix of --apply is refused on caps too  "
             "<-- pinned defect")
     refuses(["caps", "--serv", "x"], "a prefix of --service-url is refused")
@@ -4667,7 +4727,7 @@ def _parse(argv):
         prog="sharewatch.py",
         allow_abbrev=False,
         description="Diff an ArcGIS organization's sharing posture against "
-                    "yesterday, because the platform keeps no audit log.",
+                    "yesterday, because the portal reports only what is shared now.",
         epilog="Read-only. There is no flag that changes sharing. A password or "
                "token is never a flag: export %s or %s, or answer the prompt."
                % (SECRET_ENV, TOKEN_ENV),
@@ -5015,10 +5075,19 @@ def _caps(args):
     if not is_http_url(args.service_url):
         print("error: --service-url %s." % URL_RULE, file=sys.stderr)
         return 64
+    if "?" in args.service_url or "#" in args.service_url:
+        print("error: --service-url takes the bare service or layer url, with "
+              "no query string or fragment (drop ?f=json).", file=sys.stderr)
+        return 64
     was = parse_capabilities(args.was)
     if not was:
         print("error: --was has to name at least one capability, such as "
               "Create.", file=sys.stderr)
+        return 64
+    if any(len(name.split()) > 1 for name in was.values()):
+        print("error: --was takes a comma-separated list, such as "
+              "Create,Query. A name with a space in it is not a capability.",
+              file=sys.stderr)
         return 64
     host = host_of(args.service_url)
     try:

@@ -1,7 +1,7 @@
 # sharewatch
 
-Diff your ArcGIS organization's sharing posture against yesterday, because the platform keeps no
-audit log. Read-only, never changes sharing. The `mirror` mode does the same comparison between
+Diff your ArcGIS organization's sharing posture against yesterday, because the portal reports only
+what is shared now. Read-only, never changes sharing. The `mirror` mode does the same comparison between
 two portals, for the day after a cutover. The `caps` mode re-reads a view's capabilities after a
 definition update and asks it for rows with no token, for the minute after an edit.
 
@@ -24,10 +24,15 @@ the layer's capabilities listed `Query` as well, and a request with no token cou
 Nobody read the capabilities again. The `caps` mode is that second read, and it also asks the view
 for rows the way a stranger would.
 
-ArcGIS Online has no sharing audit log. The portal will tell you the layer is public right now,
-and nothing else: not when it changed, not who changed it, not what else moved with it. The
-item's modified date is the only trace, and the next edit overwrites it. So the honest answer to
-"how long was it exposed, and what else went with it" is that nobody knows.
+The item will tell you the layer is public right now, and its modified date, which the next edit
+overwrites. It does not tell you what else moved with it. ArcGIS Online does have an activity
+report: "a log of all activity in your organization for a specified time period" ([Esri report
+fields][aoreport]), with an actor, an action and a UTC time stamp for each entry. It is an export
+you request for a period and filter yourself. Esri's page does not say which actions it lists,
+whether sharing changes are among them, or how long entries are kept, and this tool did not
+exercise it. So the answer to "how long was it exposed, and what else went with it" depends on
+whether someone pulled and kept that report. `sharewatch` keeps its own dated snapshots and
+compares them.
 
 The block below is an excerpt of a real run, in run order. A line that reads `...` stands for lines left out, and the last line is the real count.
 
@@ -170,7 +175,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 ...
-600 assertions, 0 failed
+605 assertions, 0 failed
 ```
 
 ## Requirements
@@ -178,10 +183,10 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 600 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 605 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. Python 3.9 is checked by hand, by parsing the file for 3.9 syntax. That check is not in the
-repository or the self-test, and the file was never run on 3.9.
+there. The self-test also passed with the same 605 assertions on CPython 3.9.25 and 3.10.20 on the
+Windows workstation, which is the oldest version it was run on.
 `arcpy` is not used and the `arcgis` package is not needed.
 
 ```
@@ -432,6 +437,7 @@ catches the same outcome from any other edit.
 [updatedef]: https://developers.arcgis.com/rest/services-reference/enterprise/update-definition-feature-layer/
 [viewsref]: https://doc.esri.com/en/arcgis-online/latest/manage-data/create-hosted-views.html
 [featuresapi]: https://developers.arcgis.com/python/latest/api-reference/arcgis.features.toc.html
+[aoreport]: https://doc.esri.com/en/arcgis-online/latest/reference/report-fields.html
 
 
 ## What it records
@@ -537,13 +543,14 @@ one yesterday and then written the comparison, and the comparison is the part wi
 it.
 
 The `arcgis` Python API does the same job more pleasantly: `gis.content.search()` and
-`item.shared_with` give you the current state in a few lines. That is the right tool for reading
+`item.sharing` give you the current state in a few lines. That is the right tool for reading
 the state. This one exists because it keeps the history and does the diff, and because it has no
 dependency to install on a locked-down server where the scheduled task has to run.
 
-ArcGIS Enterprise portal logs do record some sharing calls, which is more than ArcGIS Online
-offers. They are per-deployment, they roll over, and they are not searchable by item. If you are
-on Enterprise, read them first.
+An ArcGIS Online administrator can also download the activity report described above, and that is
+the existing tool to try first when you need to know who changed an item and when. ArcGIS
+Enterprise has its own portal logs. Neither their coverage of sharing calls nor how long they are
+kept is cited here, and neither was exercised. If you are on Enterprise, read them first.
 
 For the capability flip, the tool that exists is the service itself. Open the layer's REST page,
 or read `FeatureLayer.properties` in the `arcgis` Python API ("retrieves and set properties of this
@@ -579,8 +586,8 @@ too.
 
 - It compares snapshots, so it sees nothing before the first one. Start taking them today.
 - Resolution is the interval between snapshots. Shared and unshared between two runs is invisible.
-- It cannot say who made a change. ArcGIS Online does not record that anywhere, and this tool
-  reports the item's owner, who is often not the person who clicked.
+- It cannot say who made a change. This tool reports the item's owner, who is often not the person
+  who clicked. The ArcGIS Online activity report has an actor field, and this tool does not read it.
 - Times come from the item's modified date, which sharing does not always update. The collapse
   window is a heuristic over that date, not an event log.
 - `--insecure` skips certificate verification and exists for Enterprise portals behind an
@@ -614,7 +621,7 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows (2421 statements, 538 branches), measured with `coverage run --branch`. The Linux host
+- Coverage is 100 percent branch on Windows (2456 statements, 550 branches), measured with `coverage run --branch`. The Linux host
   has no `coverage` module installed, so the Linux run reports the assertion count only.
 
 More limits, each one a sentence:
@@ -661,7 +668,7 @@ More limits, each one a sentence:
 - An anonymous count that fails with a 5xx, a timeout, a refused connection or an answer that is not JSON is exit 3. A refusal is HTTP 401 or 403, or an error object with code 401, 403, 498 or 499. Any other 4xx, such as 404, 407, 408 or 429, is exit 3. A layer that answers a stranger in some other way, such as a 200 without `count`, is exit 3 too.
 - The refusal as an error object inside an HTTP 200 is not in the REST reference, and no source for it is cited here. `caps` accepts a refusing status or a refusing code in the body, so it does not depend on which one a server uses.
 - The `where=1=1` count is the only probe. A layer with a definition query counts the rows the definition lets through, and a view with no rows answers a count of 0, which still counts as open.
-- `--service-url` is used as typed, with no query string or credentials expected in it. The host is printed on success and the full url on an error, so a key typed into the query string under a name other than `token`, `access_token` or `password` reaches standard error. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
+- `--service-url` is used as typed, with no query string or credentials expected in it. The host is printed on success and the full url on an error, so a secret typed into the path reaches standard error. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
 - A `400` error object inside an HTTP 200 is unknown, not closed, because a server that is failing can use it too. A layer that lists no `Query` and answers `400` to a stranger therefore ends the run as exit 3 with a line naming the code.
 - A `--service-url` whose last path segment is a non-ASCII digit, such as a superscript, passes the digit test and then fails `int()`. That input is not expected.
 - The sample blocks in the Mirror and Caps sections come from stub runs whose data is not shipped, so you cannot regenerate them. The self-test covers the same cases.
@@ -693,17 +700,24 @@ More limits, each one a sentence:
 - For `caps`, a run with no token exits 0 when the result is clean and only prints a warning. The capabilities are then what a stranger is shown.
 - A clean Create-only view may exit 3 until the real refusal code Esri sends a stranger is known, because only HTTP 401 and 403 and body codes 401, 403, 498 and 499 count as closed.
 - `caps` sends the token as a query parameter on every GET, including to a plain `http://` `--service-url`. Use `https://` there, because the token travels in the query string.
-- `--was` is a comma-separated list of exact capability names, such as `Create,Query`. A misspelt name or a space-separated list gives a false `cap-flip` and `cap-added`, exit 1.
+- `--was` is a comma-separated list of exact capability names, such as `Create,Query`. A name with a space in it, such as `Create Query`, is refused with exit 64. A misspelt name still gives a false `cap-flip` and `cap-added`, exit 1.
 - A body error code is matched only as an integer. A string code such as `"403"` counts as unknown, so the run exits 3 or reports the flip as inconclusive. That fails safe.
 - A missing password exits 2, the same as a portal failure, though it is a configuration error.
 - A `--query` or `--url` holding characters the console code page cannot encode, such as Greek on cp1252, stops with `unexpected UnicodeEncodeError` and exit 2 after some output.
-- `--service-url` with a query string, such as `.../FeatureServer?foo=bar`, builds a malformed layer url because `/0` is appended after the query. Any key other than `token`, `access_token` and `password` is echoed in errors.
+- A `--service-url` with a query string or a fragment, such as `.../FeatureServer?f=json`, is refused with exit 64, because `/0` would be appended after the query.
 - The redirect pin compares host names only. A same-host redirect from `https` to `http`, or to another port, is followed and carries the token in clear text.
 - Item titles, owners, group names and messages in a `--responses` file are printed raw, so a member of the organization can forge a line that looks like a finding. The exit code is not affected.
 - Snapshot writes are not atomic, and two `--apply` runs in the same second overwrite each other.
 - The 20-mutation spot check of `caps` and the macOS statement that the stub server binds only `127.0.0.1` by default are not exercised by anything in this repository.
 - Portal error messages are printed to standard error as the portal returns them, control characters included, as item titles are.
-- `redact()` matches the raw, `quote_plus` and `quote` forms of a secret only. A server that echoes a token in another encoding, such as HTML entities, is not redacted.
+- `redact()` matches the raw, `quote_plus` and `quote` forms of a secret only. A server that echoes a token in another encoding, such as HTML entities, is not redacted. Nor is a token that a server echoes percent-encoded twice, for example a login redirect that copies the request URL into `Location`, if the token holds characters outside letters, digits and `-_.`.
+- Text read from a `--responses` file, and the `unexpected <Type>` line, are printed as written. Remove tokens from saved responses before you pass them in.
+- The `--username` path was tested only against a stub that does not check the `Referer` header, and it was not run against a live portal. A portal that rejects a referer-bound token arriving without a `Referer` header would show as exit 2, not as a false clean.
+- An HTTP 403 from a proxy or firewall in front of the service is read as a refusal by the service. A layer can then be called closed when the gateway, not the service, refused the stranger, and `caps` exits 0 for a layer that is readable by a browser the gateway lets through.
+- `caps` applies one `--was` to every layer. When the layers of one service held different capabilities, run `caps` once per layer url, because a `--was` containing `Query` silences the open-count finding on every layer.
+- `diff` does not check that its two snapshots came from the same portal url. Two portals in one `watch --dir` give a false diff with exit 1.
+- That an organization content report is a CSV with one row per item including its access is not cited here and was not exercised. Neither were the ArcGIS Enterprise portal logs or the ArcGIS Online activity report.
+- On a public Create-only view whose anonymous query Esri answers with an error code other than 401, 403, 498 or 499, `caps` exits 3 on every run until that code is known. This is the safe direction.
 
 ## Contributing
 
