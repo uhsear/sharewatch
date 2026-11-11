@@ -111,7 +111,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 --------------------------------------------------------------------
-547 assertions, 0 failed
+560 assertions, 0 failed
 ```
 
 ## Requirements
@@ -119,9 +119,10 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 547 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 560 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. Python 3.9 is checked by parsing the file for 3.9 syntax, not by running it on 3.9.
+there. Python 3.9 is checked by hand, by parsing the file for 3.9 syntax. That check is not in the
+repository or the self-test, and the file was never run on 3.9.
 `arcpy` is not used and the `arcgis` package is not needed.
 
 ```
@@ -189,7 +190,8 @@ urllib repeats the request in some of its exceptions.
 The token gets the same treatment and has no flag either. Export `SHAREWATCH_TOKEN`, or for
 `mirror` `SHAREWATCH_OLD_TOKEN` and `SHAREWATCH_NEW_TOKEN`. An earlier version took `--token`,
 and a token in `argv` is readable by every process on the machine. A mistyped flag is echoed by
-name only, so a `--tokn=VALUE` typo does not print its value. Getting the error text right took
+name only, so a `--tokn=VALUE` typo does not print its value. A bad mode is refused without printing the word, so the old
+`--token VALUE` form is never echoed. Getting the error text right took
 two goes. A token is sent as a query
 parameter, and urllib answers a url it cannot open by quoting the whole url back inside the
 exception. `--url example.maps.arcgis.com`, with the scheme left off, printed a live token to
@@ -319,8 +321,8 @@ update. For each layer and table of the service, `caps` does three things:
 
 1. It reads the service root, which lists the layers and tables. A url that ends in a layer number
    reads that one layer.
-2. It reads each layer's `capabilities` with your token. Esri documents the property as one
-   comma-separated string, such as `Create,Delete,Query,Update,Editing` ([feature layer][layerref]).
+2. It reads each layer's `capabilities` with your token. Esri's example for the property is one
+   comma-separated string, `Create,Delete,Query,Update,Editing` ([feature layer][layerref]).
 3. It asks each layer for a row count with no token at all: `query?where=1=1&returnCountOnly=true`.
    The Query operation needs the `Query` capability ([query][queryref]), and `returnCountOnly`
    makes the answer a `count` ([query][queryref]).
@@ -345,20 +347,20 @@ The exit code was 1. Layer 1 is not printed, because nothing changed on it.
 |---|---|---|
 | 100 | `cap-flip-open` | A count with no token returned rows from a layer whose `--was` did not hold `Query`. |
 | 70 | `cap-added` | A capability other than `Query` was added. It is read from the list, never probed. |
-| 60 | `cap-flip` | `Query` was added, and the anonymous count was refused or gave no answer. The view is not readable by strangers today. Check its sharing before it reaches Everyone. |
+| 60 | `cap-flip` | `Query` was added, and the anonymous count was refused or gave no answer. The view is not shown to be readable by strangers today. Check its sharing before it reaches Everyone. |
 
 How it reads the anonymous count:
 
 - Rows came back: open. A count of 0 is open, because an empty layer still answers.
-- An HTTP 4xx status, or an error object with a 4xx code: closed.
-- Anything else is unknown. That covers a 5xx, a timeout, a refused connection, a page that is not
+- An HTTP 401 or 403 status, or an error object with code 401, 403, 498 or 499: closed.
+- Anything else is unknown. That covers any other 4xx (such as 404, 407, 408 and 429), a 5xx, a timeout, a refused connection, a page that is not
   JSON and a 200 with neither a count nor an error. Unknown is never called closed. If `Query` was
   added, the finding says the count was inconclusive. If nothing was found, the run exits 3.
 - A view whose `--was` already held `Query` is never a flip. Its count works because it did before.
 
 The refusal in the stub comes both ways: an HTTP 403 status in process, and an error object with
 HTTP 200 over the socket. Esri's REST reference does not say which one a layer uses for a stranger.
-The error object inside a 200 is what Esri community posts describe, and `caps` accepts both.
+No source is cited for the error object inside a 200, and `caps` accepts both.
 
 Why the cause is not claimed. Esri's page on hosted views says "You can exclude fields from the
 view" and that you can "share a read-only feature layer view with the public"
@@ -553,7 +555,7 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows (2284 statements, 500 branches), measured with `coverage run --branch`. The Linux host
+- Coverage is 100 percent branch on Windows (2299 statements, 504 branches), measured with `coverage run --branch`. The Linux host
   has no `coverage` module installed, so the Linux run reports the assertion count only.
 
 More limits, each one a sentence:
@@ -597,10 +599,23 @@ More limits, each one a sentence:
 - `caps` probes reads only. A `Create`, `Update` or `Delete` that was added is reported from the list. The tool never writes, so it cannot test an anonymous edit.
 - `caps` does not read the item's sharing. A flip on a view that is not shared to Everyone is `cap-flip`, ranked 60, with the sharing check left to you.
 - A view that held `Query` before is not reported, and that is by design: there is no flip. It also means `caps` is not an audit of every readable view.
-- An anonymous count that fails with a 5xx, a timeout, a refused connection or an answer that is not JSON is exit 3. A refusal is a 4xx status or an error object with a 4xx code. A layer that answers a stranger in some other way, such as a 200 without `count`, is exit 3 too.
-- The refusal as an error object inside an HTTP 200 comes from Esri community posts and not from the REST reference. `caps` accepts a 4xx status or a 4xx code in the body, so it does not depend on which one a server uses.
+- An anonymous count that fails with a 5xx, a timeout, a refused connection or an answer that is not JSON is exit 3. A refusal is HTTP 401 or 403, or an error object with code 401, 403, 498 or 499. Any other 4xx, such as 404, 407, 408 or 429, is exit 3. A layer that answers a stranger in some other way, such as a 200 without `count`, is exit 3 too.
+- The refusal as an error object inside an HTTP 200 is not in the REST reference, and no source for it is cited here. `caps` accepts a refusing status or a refusing code in the body, so it does not depend on which one a server uses.
 - The `where=1=1` count is the only probe. A layer with a definition query counts the rows the definition lets through, and a view with no rows answers a count of 0, which still counts as open.
-- `--service-url` is used as typed, with no query string or credentials expected in it. Only the host is printed. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
+- `--service-url` is used as typed, with no query string or credentials expected in it. The host is printed on success and the full url on an error, so a key or `user:password@` typed into it reaches standard error. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
+- A `400` error object inside an HTTP 200 is unknown, not closed, because a server that is failing can use it too. A layer that lists no `Query` and answers `400` to a stranger therefore ends the run as exit 3 with a line naming the code.
+- A `--service-url` whose last path segment is a non-ASCII digit, such as a superscript, passes the digit test and then fails `int()`. That input is not expected.
+- The sample blocks in the Mirror and Caps sections come from stub runs whose data is not shipped, so you cannot regenerate them. The self-test covers the same cases.
+- The mutation counts above come from a harness that is not in this repository, so you cannot check them from here.
+- `--verify-host` against a hosted ArcGIS Online organization was not run live, so the claim that it is probably refused is untested.
+- A token from `SHAREWATCH_TOKEN` is sent over an unverified connection when `--insecure` is set, and in clear text when the url is `http://`. Only `--username` is refused with those, so check the url before you export a token.
+- `caps` sends the token to whatever host `--service-url` names, and that host need not be the portal that issued it.
+- urllib reads `HTTP_PROXY` and `HTTPS_PROXY` from the environment, so a token in a query string also reaches the proxy's access log.
+- The last-resort handler in `main()` prints `error: unexpected <Type>: <message>` without `redact()`. No known path puts a credential there.
+- A `--query`, `--url` or snapshot path that the console code page cannot encode, such as Greek on cp1252, ends as `unexpected UnicodeEncodeError` with exit 2 after the first lines are printed, because only finding lines go through `printable()`.
+- A snapshot file takes the process's default permissions and holds item titles, owners and sharing levels for the whole org, so keep `--out` in a restricted folder.
+- Two `--apply` runs in the same second write the same file name, and the second overwrites the first.
+- The redirect pin and the host comparison ignore the port and the scheme in `caps` and `snapshot`, as they do in `mirror`.
 
 ## Contributing
 

@@ -996,25 +996,31 @@ def parse_capabilities(text):
     return dict((name.lower(), name) for name in names if name)
 
 
+# An HTTP status that refuses a stranger, and the codes of an Esri error object
+# that does. 498 is an invalid token and 499 a token required.
+CLOSED_STATUSES = (401, 403)
+CLOSED_CODES = (401, 403, 498, 499)
+
+
 def probe_verdict(status, body):
     """Read the answer to an anonymous row count. Returns (state, why).
 
     "open" is rows (a count) handed to a caller with no token. "closed" is an
-    answer that refused: an HTTP 4xx status, or an error object in the body
-    with a 4xx code, which is how the portal usually refuses with HTTP 200.
-    Everything else is "unknown", and a 5xx is that too: a server error does
-    not prove that the layer is closed, and calling it closed would be a false
-    clean.
+    answer that refused the caller: HTTP 401 or 403, or an error object in the
+    body with code 401, 403, 498 or 499, which is how the portal usually
+    refuses with HTTP 200. Everything else is "unknown". That includes a 5xx,
+    a 408, a 429, a 404 and a proxy's 407: none of them says whether the layer
+    is readable, and calling one closed would be a false clean.
     """
     if status is not None:
-        return ("closed" if 400 <= status < 500 else "unknown",
+        return ("closed" if status in CLOSED_STATUSES else "unknown",
                 "HTTP %d" % status)
     if not isinstance(body, dict):
         return "unknown", "the answer was not a JSON object"
     if "error" in body:
         err = body["error"]
         code = err.get("code") if isinstance(err, dict) else None
-        if isinstance(code, int) and 400 <= code < 500:
+        if code in CLOSED_CODES:
             return "closed", "error %d" % code
         return "unknown", "an error answer with code %s" % (code,)
     count = body.get("count")
@@ -3866,6 +3872,20 @@ def _self_test():
                   and "SECRETVALUE" not in leaked,
                   "an unrecognised --flag=value is refused by name without its "
                   "value  <-- pinned defect")
+        for argv in (["--token", "SECRETVALUE", "snapshot", "--url", "x"],
+                     ["--password", "SECRETVALUE", "snapshot"],
+                     ["SECRETVALUE"]):
+            sys.stderr = io.StringIO()
+            refused = None
+            try:
+                _parse(argv)
+            except SystemExit as exc:
+                refused = exc.code
+            leaked = sys.stderr.getvalue()
+            check(refused == 64 and "SECRETVALUE" not in leaked,
+                  "a secret typed in the old --flag VALUE form, before or as "
+                  "the mode, is refused without being echoed (%s)  "
+                  "<-- pinned defect" % argv[0])
     finally:
         sys.stderr = noise
 
@@ -3916,6 +3936,27 @@ def _self_test():
             (403, None, "closed", "an HTTP 403 is closed"),
             (503, None, "unknown",
              "an HTTP 503 is not proof of a closed layer  "
+             "<-- pinned defect"),
+            (401, None, "closed", "an HTTP 401 is closed"),
+            (404, None, "unknown",
+             "an HTTP 404 says nothing about the layer  <-- pinned defect"),
+            (407, None, "unknown",
+             "a proxy's HTTP 407 says nothing about the layer  "
+             "<-- pinned defect"),
+            (408, None, "unknown",
+             "an HTTP 408 timeout says nothing about the layer  "
+             "<-- pinned defect"),
+            (429, None, "unknown",
+             "an HTTP 429 rate limit says nothing about the layer  "
+             "<-- pinned defect"),
+            (None, {"error": {"code": 498}}, "closed",
+             "an error object with 498 is closed"),
+            (None, {"error": {"code": 401}}, "closed",
+             "an error object with 401 is closed"),
+            (None, {"error": {"code": 404}}, "unknown",
+             "a 404 error object proves nothing  <-- pinned defect"),
+            (None, {"error": {"code": 400}}, "unknown",
+             "a 400 error object may be a failing service, not a refusal  "
              "<-- pinned defect")):
         check(probe_verdict(status, body)[0] == want,
               "probe: %s" % label)
@@ -4224,6 +4265,9 @@ def _self_test():
           "a real HTTP 403 status is closed")
     check(probing(FakeService({}, open_error=http_error(503)))[0] == "unknown",
           "a real HTTP 503 status is unknown  <-- pinned defect")
+    check(probing(FakeService({}, open_error=http_error(429)))
+          == ("unknown", "HTTP 429"),
+          "a real HTTP 429 status is unknown, not closed  <-- pinned defect")
     check(probing(FakeService({}, open_error=lambda t: OSError("down")))
           == ("unknown", "no usable answer (OSError)"),
           "no connection is unknown, and the message carries no url")
@@ -4332,6 +4376,9 @@ def _verdict(passed, failed):
 
 # ----------------------------------------------------------------------- cli
 
+MODES = ("snapshot", "diff", "watch", "mirror", "caps")
+
+
 class _Parser(argparse.ArgumentParser):
     """An argument parser whose usage errors exit 64, like every other usage error.
 
@@ -4355,7 +4402,6 @@ def _parse(argv):
                % (SECRET_ENV, TOKEN_ENV),
     )
     ap.add_argument("mode", nargs="?",
-                    choices=["snapshot", "diff", "watch", "mirror", "caps"],
                     help="snapshot writes one, diff compares two, watch takes a "
                          "fresh one and compares it with the newest in --dir, "
                          "mirror compares two portals and writes nothing, caps "
@@ -4422,6 +4468,10 @@ def _parse(argv):
         # --flag=value carries its value into the error. Only the name is shown.
         ap.error("unrecognized arguments: %s"
                  % " ".join(arg.split("=", 1)[0] for arg in extra))
+    if args.mode is not None and args.mode not in MODES:
+        # Not argparse's choices=: its error prints the rejected word, and a
+        # secret typed as "--token VALUE" before the mode lands here as the mode.
+        ap.error("the mode is not one of: %s" % ", ".join(MODES))
     return args
 
 
