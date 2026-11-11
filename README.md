@@ -29,6 +29,8 @@ and nothing else: not when it changed, not who changed it, not what else moved w
 item's modified date is the only trace, and the next edit overwrites it. So the honest answer to
 "how long was it exposed, and what else went with it" is that nobody knows.
 
+The block below is an excerpt of a real run. A line that reads `...` stands for lines left out, and the last line is the real count.
+
 ```
 $ python sharewatch.py --self-test
 sharewatch self-test: no portal, no network, no credentials
@@ -61,6 +63,7 @@ PASS  a windows console gets a replaced character, not a crash that loses every 
 ...
 PASS  a unique prefix of --apply is refused, so the write flag is never reached by abbreviation  <-- pinned defect
 PASS  a scheme-less --url is refused before any request is built  <-- pinned defect
+PASS  a credential typed into --url is refused before any request and never echoed  <-- pinned defect
 PASS  items as a JSON list is refused, because the diff indexes items by id and would raise TypeError instead  <-- pinned defect
 PASS  paging reads all 250 items, not the 100 the server caps a page at  <-- pinned defect
 PASS  the portal's modified date is carried into the record, not zeroed  <-- pinned defect
@@ -104,6 +107,9 @@ PASS  a new url that answers but declares another host is refused, so a DNS alia
 PASS  Query added and an anonymous count that works is the flip, open
 PASS  a layer that does not list Query and answers an anonymous count is reported, because the answer is the exposure  <-- pinned defect
 PASS  a count the server failed to answer is exit 3, not a clean 0  <-- pinned defect
+PASS  mirror read by a publisher cannot call two portals alike: it exits 3 and says whose view is partial  <-- pinned defect
+PASS  watch read by a publisher cannot call a day quiet: it exits 3  <-- pinned defect
+PASS  the first watch run has nothing to compare with, says so and exits 3, never 0  <-- pinned defect
 PASS  the capabilities are read with the token and the count is asked with no token at all  <-- pinned defect
 ...
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted and two failed portal calls as six failures, so a broken tool turns this self-test red  <-- pinned defect
@@ -111,15 +117,15 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 --------------------------------------------------------------------
-560 assertions, 0 failed
+590 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
-`argparse`, `datetime`, `getpass`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
+`argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 560 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 590 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
 there. Python 3.9 is checked by hand, by parsing the file for 3.9 syntax. That check is not in the
 repository or the self-test, and the file was never run on 3.9.
@@ -206,7 +212,7 @@ Exit codes:
 | 0 | No differences, and the read was whole. |
 | 1 | Anything to read. A narrowing or a deletion is a difference too, so 1 does not mean "something widened". |
 | 2 | The portal or service call failed, a mirror host proof failed, or the tool hit an error it does not know. |
-| 3 | No differences found, but the read cannot prove it: it held no items, was cut short, was made without a token, or left group memberships unread. A `watch` run without `--apply` and without a baseline also exits 3. For `caps`: a layer that lists no capabilities, or an anonymous count that gave no usable answer, with no flip found. |
+| 3 | No differences found, but the read cannot prove it: it held no items, was cut short, was made without a token, was made by an account that is not an organization administrator, or left group memberships unread. A `watch` run with no earlier snapshot in `--dir` also exits 3, with or without `--apply`, because it compared nothing. For `caps`: a layer that lists no capabilities, or an anonymous count that gave no usable answer, with no flip found. |
 | 64 | Usage error, a corrupt baseline file, or a sharing level this version does not know. |
 
 A scheduler that alerts only on 1 and 2 treats 3 as success. Alert on any non-zero code.
@@ -550,7 +556,7 @@ too.
   either side is reported as `mirror-ambiguous` and not compared. A renamed item reads as one
   `mirror-missing` and one new item. Owners are not compared, because accounts differ after a move.
 - Mirror compares the sharing it can see with the token it was given. An item the account cannot
-  see is absent from the snapshot and reads as missing. Use an administrator token on each side.
+  see is absent from the snapshot and reads as missing. A token whose account is not an organization administrator makes the run exit 3 with a line saying so, even when nothing differs. Use an administrator token on each side.
 - `--verify-host` compares host names, not ports. Two portals on one host name and two ports are
   not told apart. A reverse proxy that rewrites `portalHostname` would pass the declared-host test.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
@@ -582,15 +588,15 @@ More limits, each one a sentence:
 - A `--responses` entry whose `itemId` is a JSON list raises `TypeError` and ends as exit 2 with `unexpected TypeError`.
 - `watch` picks its baseline by file name only. A file named `sharewatch-` plus anything, or a snapshot of another portal in the same `--dir`, can become the baseline.
 - A snapshot is written non-atomically. A full disk can leave a truncated newest file, and the next `watch` run stops with exit 64 on it.
-- A `--url` with `user:password@` in it is printed back as typed, because only the known token and password are redacted. Pass the bare portal url.
-- The stored `url` of a snapshot is whatever `--url` held, so it can hold a query string or credentials if you typed them.
+- A `--url`, `--old-url`, `--new-url` or `--service-url` that carries `user:password@`, or `token`, `access_token` or `password` in its query string, is refused with exit 64 and is never printed back. Another secret in a query string, such as an API key under a name this check does not know, is still printed in an error.
+- The stored `url` of a snapshot is whatever `--url` held, so it can hold a query string if you typed one.
 - A `--username` sign-in over an `http://` url sends the password in clear text. Use `https://`.
 - The redirect pin compares host names only, so a redirect from https to http, or to another port on the same host, is followed.
 - Tokens travel as query parameters on GET requests, so a proxy or portal access log on the path records them.
 - Esri may serve group and item searches from an index that lags behind edits, so run `mirror` a while after the cutover and use an administrator token on each side.
 - Item titles, owners and group names are printed as the portal returns them, control characters included, so a member of the org can forge finding-looking lines. The exit code is not affected.
 - An event lists its first 20 items and counts the rest, so a bulk finding does not name every item.
-- With no console and no `SHAREWATCH_PASSWORD`, the password prompt fails with `unexpected EOFError`, exit 2, and no hint to set the variable.
+- With `--username`, no `SHAREWATCH_PASSWORD` and no terminal on standard input, the run stops with exit 2 and `no password: set SHAREWATCH_PASSWORD`. On Windows, `getpass` reads the console and not standard input, and `isatty()` answers True for the NUL device that a scheduled task may hold. Before this check such a run waited for ever. The check asks `GetStdHandle(STD_INPUT_HANDLE)`, which Microsoft documents as initially the console input buffer, and then `GetConsoleMode`, which Microsoft documents as succeeding for a console input buffer handle. The page for `GetConsoleMode` also says it should not be used to decide whether a handle is a console, and names `NtQueryVolumeInformationFile` instead. This tool uses `GetConsoleMode` once. That it fails for NUL is not stated on the page: it was observed on Windows 11 with a real run with standard input on NUL, which the self-test repeats, and not checked on other Windows versions or on a service with no standard handles.
 - An empty `SHAREWATCH_PASSWORD` or token variable is treated as unset.
 - The `snapshot`, `diff` and `watch` network paths run against an in-process stand-in. Only `mirror`, `caps` and the shared request layer run over real loopback sockets.
 - `caps` was run against stubs only. It was never run against a live ArcGIS Online or Enterprise service, and the stub's refusals are the stub's own words, not recorded Esri answers.
@@ -603,7 +609,7 @@ More limits, each one a sentence:
 - An anonymous count that fails with a 5xx, a timeout, a refused connection or an answer that is not JSON is exit 3. A refusal is HTTP 401 or 403, or an error object with code 401, 403, 498 or 499. Any other 4xx, such as 404, 407, 408 or 429, is exit 3. A layer that answers a stranger in some other way, such as a 200 without `count`, is exit 3 too.
 - The refusal as an error object inside an HTTP 200 is not in the REST reference, and no source for it is cited here. `caps` accepts a refusing status or a refusing code in the body, so it does not depend on which one a server uses.
 - The `where=1=1` count is the only probe. A layer with a definition query counts the rows the definition lets through, and a view with no rows answers a count of 0, which still counts as open.
-- `--service-url` is used as typed, with no query string or credentials expected in it. The host is printed on success and the full url on an error, so a key or `user:password@` typed into it reaches standard error. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
+- `--service-url` is used as typed, with no query string or credentials expected in it. The host is printed on success and the full url on an error, so a key typed into the query string under a name other than `token`, `access_token` or `password` reaches standard error. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
 - A `400` error object inside an HTTP 200 is unknown, not closed, because a server that is failing can use it too. A layer that lists no `Query` and answers `400` to a stranger therefore ends the run as exit 3 with a line naming the code.
 - A `--service-url` whose last path segment is a non-ASCII digit, such as a superscript, passes the digit test and then fails `int()`. That input is not expected.
 - The sample blocks in the Mirror and Caps sections come from stub runs whose data is not shipped, so you cannot regenerate them. The self-test covers the same cases.
@@ -622,7 +628,15 @@ More limits, each one a sentence:
 - A layer that answers a stranger with an error code outside 401, 403, 498 and 499 exits 3, because the tool cannot tell closed from broken. A Create-only view that is not readable may therefore exit 3 with nothing flipped. Which code Esri returns there was not checked offline.
 - `caps` ignores flags that belong to other modes, such as `--dir`, `--out` and `--query`, and `--url` without `--username`, without a word.
 - `.gitignore` does not exclude `sharewatch-*.json`. A snapshot holds item titles, owners and sharing levels for the whole org, so keep `--out` outside any repository.
-- A snapshot taken with a token that is not an administrator's holds only the items and groups that account can see. It is not marked incomplete and the run exits 0, so use an administrator token for `snapshot` and `watch` as well as `mirror`.
+- A snapshot taken with a token that is not an administrator's holds only the items and groups that account can see. `snapshot`, `watch` and `mirror` read `user.role` from `portals/self` and mark such a snapshot `"limited": true`, so the run exits 3 and a later `diff` of that file says so. Only the role `org_admin` counts as an administrator. A custom role with administrator privileges, and a portal that does not describe the user, are treated as limited, so those runs exit 3 although the read was whole.
+- A snapshot taken before this check carries no `limited` key, so a `diff` of an old file from a non-administrator still reads as whole.
+- A value that follows an unknown flag is printed in the usage error when the mode already holds two positional paths, as `diff` does. `diff a.json b.json --token SECRET` prints `unrecognized arguments: --token SECRET`. The other modes print only the flag.
+- The Mirror and Caps sample blocks come from stub runs that are not shipped. The Caps block was re-run against an independent `http.server` stub and gave the same output with exit 1, but that stub is not in the repository either.
+- The counts of changes in the mutation runs come from a harness that is not in this repository. Treat them as the author's report and not as something you can run.
+- The self-test pins HTTP 400, 404, 407, 408, 429 and 503, and body codes 400, 404, 407, 408, 429 and 500, as unknown. It pins no other status.
+- The Limits section is long. The limits that change an exit code are the ones about exit 3, an administrator token, the search ceiling and the host pin.
+- The sharing-change example near the Mirror section, with `item-public`, `group-public` and `item-deleted`, is illustrative and not a captured run. The count of 30 requests against 4,000 in the paging section is an estimate.
+- A search for `sharemirror` on GitHub on 2026-10-29 and again on 2026-11-10 found the same two unrelated repositories. That says what the search found, not that no tool does a two-portal comparison.
 - Portal error messages are printed to standard error as the portal returns them, control characters included, as item titles are.
 - `redact()` matches the raw, `quote_plus` and `quote` forms of a secret only. A server that echoes a token in another encoding, such as HTML entities, is not redacted.
 

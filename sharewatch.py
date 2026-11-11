@@ -48,6 +48,7 @@ from __future__ import print_function
 
 import argparse
 import contextlib
+import ctypes
 import datetime
 import getpass
 import http.server
@@ -225,15 +226,34 @@ def is_truncated(total):
     return total >= SEARCH_CEILING
 
 
+URL_SECRET_KEYS = ("token", "access_token", "password")
+URL_RULE = ("must start with https:// or http:// and carry no user:password@ "
+            "or token= part. urllib quotes a url it cannot open back into its "
+            "own error, so a credential typed into the url would reach the "
+            "log. Pass a token in the environment instead")
+
+
 def is_http_url(url):
-    """True when urllib will actually open this url.
+    """True when urllib will actually open this url and it holds no credential.
 
     A url typed without its scheme is the common mistake, and urllib answers it
     by raising an exception that quotes the whole url back, query string and
-    token included. Refusing the url up front is what stops a token reaching a
-    scheduler log.
+    token included. A url that carries user:password@ or a token in its query
+    string reaches stderr the same way, and redact() knows only the secrets the
+    tool itself holds. Refusing the url up front is what stops a credential
+    reaching a scheduler log.
     """
-    return bool(url) and url.lower().startswith(("http://", "https://"))
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if "@" in parts.netloc:
+        return False
+    keys = set(key.lower() for key, _v in
+               urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    return not keys.intersection(URL_SECRET_KEYS)
 
 
 def printable(text, encoding):
@@ -306,6 +326,22 @@ def coverage_gaps(old, new, labels=("older", "newer"),
     return gaps
 
 
+def limited_account(described, token):
+    """True when the token's account is not an organization administrator.
+
+    Search shows an account only what that account can see, so a snapshot read
+    as a publisher or a member omits every private item and group it cannot
+    reach, and a widening of one of those reads as a quiet day. portals/self
+    names the signed-in user's role only for a token. Any role but org_admin,
+    and a user the answer does not describe, counts as limited: a false alarm
+    is loud, a false clean is not.
+    """
+    if not token:
+        return False
+    user = described.get("user")
+    return not isinstance(user, dict) or user.get("role") != "org_admin"
+
+
 def snapshot_gaps(snapshot, label, empty="the %s snapshot holds no items"):
     """Why one snapshot cannot prove a quiet result, as short phrases."""
     gaps = []
@@ -319,6 +355,10 @@ def snapshot_gaps(snapshot, label, empty="the %s snapshot holds no items"):
     if snapshot.get("anonymous"):
         gaps.append("the %s snapshot was read without a token and holds "
                     "public items only" % label)
+    if snapshot.get("limited"):
+        gaps.append("the %s snapshot was read by an account that is not an "
+                    "organization administrator and holds only what that "
+                    "account can see" % label)
     return gaps
 
 
@@ -393,12 +433,12 @@ def group_record(raw):
 
 
 def build_snapshot(url, taken, items, groups, total, truncated, anonymous=False,
-                   groups_short=False):
+                   groups_short=False, limited=False):
     """Assemble the snapshot document. No credential ever enters it.
 
-    "anonymous" and "groups_short" are written only when true, so a snapshot
-    read with a token and read whole has the same bytes as before the keys
-    existed.
+    "anonymous", "groups_short" and "limited" are written only when true, so a
+    snapshot read with a token and read whole has the same bytes as before the
+    keys existed.
     """
     snapshot = {
         "sharewatch": 1,
@@ -413,6 +453,8 @@ def build_snapshot(url, taken, items, groups, total, truncated, anonymous=False,
         snapshot["anonymous"] = True
     if groups_short:
         snapshot["groups_short"] = True
+    if limited:
+        snapshot["limited"] = True
     return snapshot
 
 
@@ -1149,7 +1191,30 @@ def _fetch(endpoint, params, insecure=False, post=False, secret=None,
     return body
 
 
-def read_secret(username, env=SECRET_ENV):
+def windows_console(kernel32=None):
+    """True when Windows standard input is a console and not NUL or a pipe.
+
+    isatty() answers True for the NUL device a scheduled task is given, and
+    getpass then waits on a console that is not there. GetConsoleMode fails
+    for any handle that is not a console input buffer, which is the test.
+    """
+    kernel32 = kernel32 or ctypes.windll.kernel32
+    kernel32.GetStdHandle.restype = ctypes.c_void_p
+    handle = kernel32.GetStdHandle(-10)    # STD_INPUT_HANDLE
+    mode = ctypes.c_uint32()
+    return bool(kernel32.GetConsoleMode(ctypes.c_void_p(handle),
+                                        ctypes.byref(mode)))
+
+
+def has_terminal(stdin, os_name, console=None):
+    """True when there is somebody to type a password at."""
+    if stdin is None or not stdin.isatty():
+        return False
+    console = console or windows_console
+    return console() if os_name == "nt" else True
+
+
+def read_secret(username, env=SECRET_ENV, console=None):
     """Get the password from the environment, or prompt for it.
 
     Never from argv. getpass keeps it off the screen, and it is passed on to
@@ -1158,6 +1223,11 @@ def read_secret(username, env=SECRET_ENV):
     secret = os.environ.get(env)
     if secret:
         return secret
+    # On Windows getpass reads the console, not stdin, and blocks for ever when
+    # a scheduled task has none. No terminal on stdin means nobody to type.
+    if not has_terminal(sys.stdin, os.name, console):
+        raise RuntimeError("no password: set %s. There is no terminal to "
+                           "prompt on." % env)
     return getpass.getpass("password for %s (not echoed): " % username)
 
 
@@ -1181,10 +1251,6 @@ def portal_self(url, token, insecure=False, pin_host=None):
     params = {"token": token} if token else {}
     return _call(url, "portals/self", params, insecure=insecure,
                  pin_host=pin_host)
-
-
-def org_id(url, token, insecure=False, pin_host=None):
-    return portal_self(url, token, insecure, pin_host).get("id")
 
 
 def search_items(url, query, token, insecure=False, echo=None, pin_host=None):
@@ -1272,7 +1338,7 @@ def attach_groups(url, items, groups, token, insecure=False, echo=None,
 
 
 def take_snapshot(url, query, token, insecure=False, echo=None, pin_host=None,
-                  group_query=None):
+                  group_query=None, limited=False):
     """Read the whole sharing posture of one org into a snapshot document.
 
     group_query searches the groups. Items and groups have different search
@@ -1290,7 +1356,8 @@ def take_snapshot(url, query, token, insecure=False, echo=None, pin_host=None,
     taken = utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     return build_snapshot(url, taken, items, groups, total, truncated,
                           anonymous=not token,
-                          groups_short=listing_short or members_short)
+                          groups_short=listing_short or members_short,
+                          limited=limited)
 
 
 def layer_ids(root):
@@ -1581,6 +1648,19 @@ def _self_test():
           "a url with no scheme is refused, because urllib quotes the whole "
           "url back into its error and that url carries the token  "
           "<-- pinned defect")
+    for url, label in (
+            ("https://gis:PWSECRET@example.org/portal", "user:password@"),
+            ("https://gis@example.org/portal", "a user name alone"),
+            ("https://example.org/svc?token=TOKSECRET", "a token in the query"),
+            ("https://example.org/svc?f=json&Access_Token=X", "access_token"),
+            ("https://example.org/svc?password=X", "a password in the query"),
+            ("https://[::1/svc", "a url urllib cannot parse")):
+        check(is_http_url(url) is False,
+              "a url with %s is refused, because the error urllib raises "
+              "quotes it back and redact() cannot know it  <-- pinned "
+              "defect" % label)
+    check(is_http_url("https://example.org/svc?f=json&where=1%3D1") is True,
+          "a query string with no credential in it is accepted")
     check(is_http_url("") is False, "an empty url is refused")
     check(is_http_url(None) is False, "a missing url is refused")
     snap = build_snapshot("https://x", "t", {"a": item("a", "o", "org", 1)},
@@ -1860,6 +1940,20 @@ def _self_test():
         bad_window = main(["diff", "a.json", "b.json", "--window-minutes", "-1"])
     finally:
         sys.stderr = quiet_err
+    for argv, label in ((["snapshot", "--url",
+                           "http://gis:PWSECRET123@127.0.0.1:9"], "--url"),
+                          (["watch", "--url", "http://127.0.0.1:9/?token=TOKSECRET9",
+                            "--dir", "x"], "--url with a token")):
+        saved_err, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            cred_code = main(argv)
+            cred_seen = sys.stderr.getvalue()
+        finally:
+            sys.stderr = saved_err
+        check(cred_code == 64 and "SECRET" not in cred_seen
+              and "no user:password@" in cred_seen,
+              "a credential typed into %s is refused before any request and "
+              "never echoed  <-- pinned defect" % label)
     check(scheme_less == 64,
           "a scheme-less --url is refused before any request is built  "
           "<-- pinned defect")
@@ -1919,8 +2013,9 @@ def _self_test():
         def __init__(self, items=(), groups=(), org="ORG123", token="TESTTOKEN",
                      reported_total=None, fail_search_after=None,
                      open_error=None, cap=100, self_fields=None, password="hunter2",
-                     groups_total=None, members_total=None):
+                     groups_total=None, members_total=None, role="org_admin"):
             self.password = password
+            self.role = role                      # the signed-in user's role
             self.groups_total = groups_total      # what the group listing claims
             self.members_total = members_total    # what a member search claims
             self.items = list(items)
@@ -1963,6 +2058,8 @@ def _self_test():
                 return {"token": self.token, "expires": 9999999999999}
             if path.endswith("/portals/self"):
                 described = {"id": self.org} if self.org else {}
+                if params.get("token") and self.role:
+                    described["user"] = {"role": self.role}
                 described.update(self.self_fields)
                 return described
             if path.endswith("/community/groups"):
@@ -2159,12 +2256,12 @@ def _self_test():
     check(whole["url"] == PORTAL and whole["taken"].endswith("Z"),
           "the snapshot records which portal it came from and when")
 
-    check(serving(portal, lambda: org_id(PORTAL, "TESTTOKEN")) == "ORG123",
+    check(serving(portal, lambda: portal_self(PORTAL, "TESTTOKEN").get("id")) == "ORG123",
           "the org id is read from portals/self")
-    check(serving(FakePortal(org=None), lambda: org_id(PORTAL, None)) is None,
+    check(serving(FakePortal(org=None), lambda: portal_self(PORTAL, None).get("id")) is None,
           "a portal that will not name its org gives no id, not a wrong one")
     blind = FakePortal(org=None)
-    serving(blind, lambda: org_id(PORTAL, None))
+    serving(blind, lambda: portal_self(PORTAL, None))
     check(not any("token=" in t for t in blind.targets),
           "portals/self is asked anonymously when there is no token")
 
@@ -2205,11 +2302,65 @@ def _self_test():
             prompts.append(prompt)
             return "typed-at-the-prompt"
 
+        class Stdin(object):
+            def __init__(self, tty):
+                self.tty = tty
+
+            def isatty(self):
+                return self.tty
+
+        class Kernel32(object):
+            """A stand-in for ctypes.windll.kernel32."""
+
+            def __init__(self, is_console):
+                self.is_console = is_console
+                self.GetStdHandle = lambda number: 7
+                self.GetStdHandle.restype = None
+
+            def GetConsoleMode(self, handle, mode):
+                return 1 if self.is_console else 0
+
+        check(windows_console(Kernel32(True)) is True
+              and windows_console(Kernel32(False)) is False,
+              "a Windows standard input is a console only when GetConsoleMode "
+              "says so")
+        check(has_terminal(Stdin(True), "posix") is True
+              and has_terminal(Stdin(False), "posix") is False
+              and has_terminal(None, "posix") is False,
+              "off Windows a terminal is whatever isatty says")
+        check(has_terminal(Stdin(True), "nt", lambda: True) is True
+              and has_terminal(Stdin(True), "nt", lambda: False) is False
+              and has_terminal(Stdin(False), "nt", lambda: True) is False,
+              "on Windows isatty is not enough: the NUL device answers True, "
+              "so the console test decides  <-- pinned defect")
+        hung = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "snapshot", "--url",
+             "http://127.0.0.1:9", "--username", "gis_admin"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=30)
+        check(hung.returncode == 2 and b"no password" in hung.stderr,
+              "a real run with no password and no console exits 2 with the "
+              "variable to set instead of waiting for ever  <-- pinned defect")
         real_getpass, getpass.getpass = getpass.getpass, fake_getpass
+        real_stdin = sys.stdin
         try:
-            check(read_secret("gis_admin") == "typed-at-the-prompt",
+            sys.stdin = Stdin(True)
+            check(read_secret("gis_admin", console=lambda: True)
+                  == "typed-at-the-prompt",
                   "with nothing in the environment the password is prompted for")
+            n_prompts = len(prompts)
+            for label, stdin in (("a stdin that is not a terminal", Stdin(False)),
+                                 ("no stdin at all", None)):
+                sys.stdin = stdin
+                message = fails(lambda: read_secret("gis_admin"),
+                                "%s gives no prompt to hang on" % label)
+                check("no password" in message and SECRET_ENV in message
+                      and len(prompts) == n_prompts,
+                      "%s is refused with the variable to set, and getpass is "
+                      "never called: on Windows it would block for ever  "
+                      "<-- pinned defect" % label)
         finally:
+            sys.stdin = real_stdin
             getpass.getpass = real_getpass
         check(bool(prompts) and "gis_admin" in prompts[0]
               and "not echoed" in prompts[0],
@@ -2395,8 +2546,10 @@ def _self_test():
             FakePortal(small, portal_groups),
             lambda: tmain("T0KEN", ["watch", "--url", PORTAL, "--dir", watched, "--apply",
                           ])))
-        check(code == 0 and "the baseline" in seen,
-              "the first watch run has nothing to compare with and says so")
+        check(code == 3 and "the baseline" in seen
+              and "nothing was compared" in seen,
+              "the first watch run has nothing to compare with, says so and "
+              "exits 3, never 0  <-- pinned defect")
         check(len(snapshots_in(watched)) == 1,
               "the first watch run wrote the baseline it will compare with")
         opened_up = [dict(row, access="public") for row in small]
@@ -2417,6 +2570,45 @@ def _self_test():
         check("No snapshot was written" in seen,
               "watch without --apply writes nothing either")
 
+        # An account that is not an administrator sees only part of the org, so
+        # a widening of an item it cannot see reads as a quiet day.
+        for role, label in (("org_publisher", "a publisher"),
+                            (None, "an account the portal does not describe")):
+            part_dir = os.path.join(workdir, "partial-%s" % (role or "none"))
+            os.makedirs(part_dir)
+            for apply_flag in (["--apply"], []):
+                code, seen = captured(lambda: serving(
+                    FakePortal(small, portal_groups, role=role),
+                    lambda: tmain("T0KEN", ["watch", "--url", PORTAL, "--dir",
+                                            part_dir] + apply_flag)))
+            check(code == 3 and "not an organization administrator" in seen
+                  and "No sharing changes" not in seen,
+                  "watch read by %s cannot call a day quiet: it exits 3  "
+                  "<-- pinned defect" % label)
+            check(json.load(io.open(os.path.join(
+                part_dir, sorted(os.listdir(part_dir))[-1]), "r",
+                encoding="utf-8")).get("limited") is True,
+                "the snapshot records that its account saw only part of the "
+                "org, so a later diff of two files says so too")
+        code, seen = captured(lambda: serving(
+            FakePortal(small, portal_groups, role="org_publisher"),
+            lambda: tmain("T0KEN", ["snapshot", "--url", PORTAL])))
+        check(code == 3 and "WARNING: this account is not an organization "
+              "administrator" in seen,
+              "a snapshot read by a publisher warns and exits 3")
+        code, seen = captured(lambda: serving(
+            FakePortal(small, portal_groups),
+            lambda: tmain("T0KEN", ["snapshot", "--url", PORTAL])))
+        check(code == 0 and "organization administrator" not in seen,
+              "an administrator's snapshot is whole and exits 0")
+        check(limited_account({}, None) is False
+              and limited_account({"user": {"role": "org_admin"}}, "T") is False
+              and limited_account({"user": {"role": "org_user"}}, "T") is True
+              and limited_account({"user": "gis"}, "T") is True
+              and limited_account({}, "T") is True,
+              "only an administrator's token is whole: no token is the "
+              "anonymous gap, and anything else is limited")
+
         empty_dir = os.path.join(workdir, "empty")
         os.makedirs(empty_dir)
         code, seen = captured(lambda: serving(
@@ -2432,10 +2624,11 @@ def _self_test():
             FakePortal(small, portal_groups),
             lambda: tmain("T0KEN", ["watch", "--url", PORTAL, "--dir", empty_dir,
                                     "--apply"])))
-        check(code == 0 and "This one is the baseline" in seen
+        check(code == 3 and "This one is the baseline" in seen
               and len(snapshots_in(empty_dir)) == 1,
               "a watch directory that holds no snapshot is a baseline run, "
-              "not a diff against nothing")
+              "not a diff against nothing, and a run that compared nothing "
+              "never exits 0  <-- pinned defect")
         void_dir = os.path.join(workdir, "void")
         code, seen = captured(lambda: serving(
             FakePortal([], portal_groups),
@@ -3109,6 +3302,18 @@ def _self_test():
     code, seen = run_mirror(quiet_old, quiet_new, tokens=("OLDT", "NEWT"))
     check(code == 0 and "The new portal shares what the old one did." in seen,
           "two portals that share alike exit 0 and say so")
+    for role, label in (("org_publisher", "a publisher"), (None, "an account "
+                        "the portal does not describe")):
+        lim_old = FakePortal([r for r in rows_of(old_mirror_items)
+                              if not r["id"].startswith("o-dup")],
+                             list(OLD_MIRROR["groups"].values()), org="OLDORG")
+        lim_new = FakePortal([r for r in clone_rows if "dup" not in r["id"]],
+                             clone_groups, org="NEWORG", role=role)
+        code, seen = run_mirror(lim_old, lim_new, tokens=("OLDT", "NEWT"))
+        check(code == 3 and "not an organization administrator" in seen
+              and "The new portal shares what the old one did." not in seen,
+              "mirror read by %s cannot call two portals alike: it exits 3 "
+              "and says whose view is partial  <-- pinned defect" % label)
 
     # refusals before and after the first call
     code, seen = run_mirror(*mirror_pair(), verify="elsewhere.example.org")
@@ -3953,6 +4158,15 @@ def _self_test():
              "an error object with 498 is closed"),
             (None, {"error": {"code": 401}}, "closed",
              "an error object with 401 is closed"),
+            (400, None, "unknown",
+             "a plain HTTP 400 says nothing about the layer  "
+             "<-- pinned defect"),
+            (None, {"error": {"code": 407}}, "unknown",
+             "a 407 error object proves nothing  <-- pinned defect"),
+            (None, {"error": {"code": 408}}, "unknown",
+             "a 408 error object proves nothing  <-- pinned defect"),
+            (None, {"error": {"code": 429}}, "unknown",
+             "a 429 error object proves nothing  <-- pinned defect"),
             (None, {"error": {"code": 404}}, "unknown",
              "a 404 error object proves nothing  <-- pinned defect"),
             (None, {"error": {"code": 400}}, "unknown",
@@ -4504,14 +4718,15 @@ def _snapshot(args):
     # and record that host's answer as this portal's snapshot.
     pin = host_of(args.url)
     query = args.query
-    oid = org_id(args.url, token, args.insecure, pin)
+    described = portal_self(args.url, token, args.insecure, pin)
+    oid = described.get("id")
     if not oid and not query:
         raise RuntimeError("could not read the org id, pass --query")
     return _read(args.url, token, query or "orgid:%s" % oid, args.insecure, pin,
-                 oid)
+                 oid, limited_account(described, token))
 
 
-def _read(url, token, query, insecure, pin_host=None, oid=None):
+def _read(url, token, query, insecure, pin_host=None, oid=None, limited=False):
     """Read one org into a snapshot and print what it covers.
 
     Groups are always searched by the org id when it is known: --query is an
@@ -4524,12 +4739,16 @@ def _read(url, token, query, insecure, pin_host=None, oid=None):
               "with the same query as items.")
     snapshot = take_snapshot(url, query, token, insecure,
                              echo=lambda line: print(line), pin_host=pin_host,
-                             group_query="orgid:%s" % oid if oid else None)
+                             group_query="orgid:%s" % oid if oid else None,
+                             limited=limited)
     print("%d item(s), %d group(s), reported total %d"
           % (len(snapshot["items"]), len(snapshot["groups"]),
              snapshot["reported_total"]))
     if not token:
         print("WARNING: no token, so this read sees public items only.")
+    if limited:
+        print("WARNING: this account is not an organization administrator, so "
+              "this read omits every private item and group it cannot see.")
     if snapshot["truncated"] and snapshot["reported_total"] >= SEARCH_CEILING:
         print("")
         print("WARNING: the result set reached the %d row ceiling. search "
@@ -4649,7 +4868,8 @@ def _read_side(args, side, opened):
         raise RuntimeError("could not read the org id of the %s portal, "
                            "pass --%s-query" % (side, side))
     print("\n%s portal on host %s" % (side, pin))
-    return _read(url, token, query or "orgid:%s" % oid, args.insecure, pin, oid)
+    return _read(url, token, query or "orgid:%s" % oid, args.insecure, pin, oid,
+                 limited_account(described, token))
 
 
 def _mirror(args):
@@ -4665,8 +4885,7 @@ def _mirror(args):
         return 64
     for url in (args.old_url, args.new_url):
         if not is_http_url(url):
-            print("error: a portal url must start with https:// or http://, "
-                  "got %r." % url, file=sys.stderr)
+            print("error: a portal url %s." % URL_RULE, file=sys.stderr)
             return 64
     try:
         verify = check_hosts(args.old_url, args.new_url, args.verify_host)
@@ -4729,11 +4948,10 @@ def _caps(args):
         return 64
     if args.username and not is_http_url(args.url):
         print("error: --username needs --url, the portal that signs the token "
-              "in, starting with https:// or http://.", file=sys.stderr)
+              "in. --url %s." % URL_RULE, file=sys.stderr)
         return 64
     if not is_http_url(args.service_url):
-        print("error: --service-url must start with https:// or http://, got "
-              "%r." % args.service_url, file=sys.stderr)
+        print("error: --service-url %s." % URL_RULE, file=sys.stderr)
         return 64
     was = parse_capabilities(args.was)
     if not was:
@@ -4828,9 +5046,7 @@ def _run(args):
         print("error: --url is required for %s." % args.mode, file=sys.stderr)
         return 64
     if not is_http_url(args.url):
-        print("error: --url must start with https:// or http://, got %r. "
-              "urllib quotes a url it cannot open back into its own error, "
-              "and that url carries the token." % args.url, file=sys.stderr)
+        print("error: --url %s." % URL_RULE, file=sys.stderr)
         return 64
 
     if args.mode == "snapshot":
@@ -4894,8 +5110,13 @@ def _run(args):
                   "written, so nothing was compared. Run once with --apply "
                   "to write the baseline." % args.dir)
             return 3
-        print("\nNo earlier snapshot in %s. This one is the baseline." % args.dir)
-        return 2 if write_failed else _read_exit(snapshot)
+        # Nothing was compared, so the exit is never 0: a directory that is
+        # wiped between runs would otherwise report a quiet org for ever. The
+        # first run costs one alert, and the baseline is written for the next.
+        print("\nNo earlier snapshot in %s. This one is the baseline, so "
+              "nothing was compared." % args.dir)
+        _read_exit(snapshot)
+        return 2 if write_failed else 3
     print("\nbaseline: %s" % previous)
     code = _report(baseline, snapshot, args.window_minutes)
     return 2 if write_failed and code != 1 else code
