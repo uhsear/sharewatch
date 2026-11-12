@@ -738,8 +738,11 @@ def check_hosts(old_url, new_url, verify_host):
         raise ValueError("--verify-host takes a bare host name such as "
                          "gis.example.org, with no scheme, path or port")
     if host_of(new_url) != host:
-        raise ValueError("--new-url is on host %r, not the verified host %r"
-                         % (host_of(new_url), host))
+        # The verify value is not echoed: a bare token has no "/" or ":" and
+        # passes the format check above.
+        raise ValueError("--new-url is on host %r, not the verified host "
+                         "(the --verify-host value is not repeated here)"
+                         % host_of(new_url))
     if host_of(old_url) == host:
         raise ValueError("--old-url is on the verified host %r too, so this "
                          "run would compare the new portal with itself" % host)
@@ -2918,6 +2921,16 @@ def _self_test():
                                "new.example.org"),
            "a --new-url on another host than --verify-host is refused  "
            "<-- pinned defect")
+    refusals = []
+    try:
+        check_hosts("https://old.example.org", "https://new.example.org",
+                    "hunter2SECRETVALUE")
+    except ValueError as exc:
+        refusals.append(str(exc))
+    check(len(refusals) == 1 and "hunter2SECRETVALUE" not in refusals[0]
+          and "new.example.org" in refusals[0],
+          "a bare --verify-host that is not the new host is refused without "
+          "being echoed  <-- pinned defect")
     raises(lambda: check_hosts("https://new.example.org:8443",
                                "https://new.example.org", "new.example.org"),
            "an --old-url on the verified host is refused, or the run compares "

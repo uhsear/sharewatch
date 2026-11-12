@@ -175,7 +175,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 ...
-613 assertions, 0 failed
+614 assertions, 0 failed
 ```
 
 ## Requirements
@@ -183,9 +183,9 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 613 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 614 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. The self-test also passed with the same 613 assertions on CPython 3.9.25 and 3.10.20 on the
+there. The self-test also passed with the same 614 assertions on CPython 3.9.25 and 3.10.20 on the
 Windows workstation, which is the oldest version it was run on.
 `arcpy` is not used and the `arcgis` package is not needed.
 
@@ -621,7 +621,7 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows (2464 statements, 552 branches), measured with `coverage run --branch`. The Linux host
+- Coverage is 100 percent branch on Windows (2470 statements, 552 branches), measured with `coverage run --branch`. The Linux host
   has no `coverage` module installed, so the Linux run reports the assertion count only. The Windows-only
   `ctypes` console branches run only on Windows, so no Linux coverage figure exists for them.
 
@@ -735,6 +735,9 @@ More limits, each one a sentence:
 - A proxy or WAF that refuses the default Python `urllib` user agent with HTTP 403 makes the anonymous probe read as closed where a browser would get rows. `caps` can then report a clean result for a layer that is open to browsers.
 - `--was` is split on commas only, so `Create;Query` becomes one unknown capability name. The effect is a loud false alarm, never a false clean.
 - Extra positional words are silently ignored by `snapshot`, `watch`, `mirror` and `caps`, so a mistyped word is not reported. The word is not echoed.
+- A control character in an item title can clear the screen, so a member of the org can push real findings out of view in a terminal. The exit code is still 1, so read it, or redirect the output to a file.
+- An item whose `access` field is absent reads as private in both snapshots, so a public item with no `access` would never be reported. Esri search sends `access` for every item, and this was not run live.
+- The tool writes no CSV. A title that starts with `=`, `+`, `-` or `@` is printed as it is, so a report you paste into a spreadsheet can run it as a formula.
 
 ## Contributing
 
