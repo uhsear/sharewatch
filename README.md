@@ -432,9 +432,10 @@ No source is cited for the error object inside a 200, and `caps` accepts both.
 
 Why the cause is not claimed. Esri's page on hosted views says "You can exclude fields from the
 view" and that you can "share a read-only feature layer view with the public"
-([hosted views][viewsref]). It does not say that excluding a field changes the capabilities. The
-update itself is the `updateDefinition` operation on the admin endpoint
-([update definition][updatedef]). The flip was seen in one case. `caps` reads the result, so it
+([hosted views][viewsref]). It does not say that excluding a field changes the capabilities.
+Esri's [update definition][updatedef] page documents `propagateVisibleFields` for view layers. It
+does not list `capabilities` as an updatable property, so which operation changes them was not
+checked. The flip was seen in one case. `caps` reads the result, so it
 catches the same outcome from any other edit.
 
 [layerref]: https://developers.arcgis.com/rest/services-reference/enterprise/feature-layer/
@@ -685,6 +686,10 @@ More limits, each one a sentence:
 - `--service-url` is used as typed, with no query string or credentials expected in it. The host is printed on success and the full url on an error, so a secret typed into the path reaches standard error. The token goes to that host as a query parameter, and a redirect to another host is refused. The anonymous count sends none.
 - A `400` error object inside an HTTP 200 is unknown, not closed, because a server that is failing can use it too. A layer that lists no `Query` and answers `400` to a stranger therefore ends the run as exit 3 with a line naming the code.
 - A `--service-url` whose last path segment is a non-ASCII digit, such as a superscript, passes the digit test and then fails `int()`. That input is not expected.
+- A snapshot nested deeply enough to raise `RecursionError` in the JSON reader ends as exit 2 with `unexpected RecursionError`, not as exit 64.
+- A result set that changes while it is read can leave the item count equal to the total while one item is missed. The diff then reports that item as deleted.
+- `caps` answers for the network it runs on. A gateway that refuses every anonymous request gives a clean result that does not cover the public.
+- The `caps` stub runs use a local `http.server`. No live Esri answer was observed.
 - The sample blocks in the Mirror and Caps sections come from stub runs whose data is not shipped, so you cannot regenerate them. The self-test covers the same cases.
 - The mutation counts above come from a harness that is not in this repository, so you cannot check them from here.
 - `--verify-host` against a hosted ArcGIS Online organization was not run live, so the claim that it is probably refused is untested.
@@ -747,7 +752,7 @@ More limits, each one a sentence:
 - The HTTP-status refusals of `caps` (401, 403, 404 and 503) are exercised in process with a synthetic `HTTPError`, not over a socket. Over a socket the self-test tests only HTTP 200 answers.
 - In the `caps` sample block, layer 2 gained both `Update` and `Editing`.
 - A server that ignores `returnCountOnly` and answers an anonymous query with feature rows but no count is classified unknown, not open, even though a stranger got rows. It fails safe: `caps` reports `cap-flip` as inconclusive when Query was added and exits 3 when nothing else is found, but it ranks below `cap-flip-open`.
-- `caps` run without a token exits 0 when the result is clean and prints only a warning. A layer hidden from anonymous readers fails the description read with exit 2, so the clean exit 0 is not a false clean for that case.
+- `caps` run without a token exits 0 when the result is clean and prints only a warning. A layer hidden from anonymous readers is expected to fail the description read with exit 2. That is an assumption about the portal's answer. It was not checked against Esri documentation or a live portal.
 - The `snapshot`, `diff` and `watch` network paths run in the self-test against an in-process fake opener, not against an `http.server` stub. Only `mirror` and `caps` run against a stub over a socket.
 - `HTTP_TIMEOUT` is a per-socket-operation timeout and response bodies are read without a size cap, so a server that sends bytes slowly or sends a huge body can hold a scheduled run far longer than the timeout.
 - A `ValueError` raised anywhere inside `diff_snapshots` is reported as a sharing level this version does not know, with exit 64, so a malformed hand-edited snapshot is mislabelled. It is still a non-zero exit.
