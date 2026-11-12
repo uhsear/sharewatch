@@ -3,7 +3,7 @@
 Diff your ArcGIS organization's sharing posture against yesterday, because the portal reports only
 what is shared now. Read-only, never changes sharing. The `mirror` mode does the same comparison between
 two portals, for the day after a cutover. The `caps` mode re-reads a view's capabilities after a
-definition update and asks it for rows with no token, for the minute after an edit.
+definition update and asks it for a row count with no token, for the minute after an edit.
 
 An internal layer holding addresses with occupant names is public. A resident found it and
 called. Somebody shared a folder to Everyone last week to fix a colleague's access problem, and
@@ -175,7 +175,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 ...
-615 assertions, 0 failed
+616 assertions, 0 failed
 ```
 
 ## Requirements
@@ -183,9 +183,9 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 615 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 616 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. The self-test also passed with the same 615 assertions on CPython 3.9.25 and 3.10.20 on the
+there. The self-test also passed with the same 616 assertions on CPython 3.9.25 and 3.10.20 on the
 Windows workstation, which is the oldest version it was run on.
 `arcpy` is not used and the `arcgis` package is not needed.
 
@@ -537,7 +537,7 @@ the cutover script that did not is the case this mode exists for. This tool does
 anything. It checks the result afterwards.
 
 An ArcGIS Online administrator can download an organization content report, a CSV with one row
-per item including its access. It is accurate, it is supported, and it is a photograph of right
+per item including its access (the item report has a Share Level field: private, group, organization or public, per [report fields][aoreport]). It is supported, and it is a photograph of right
 now. Yesterday's is not kept for you. If you want to know what changed, you have to have saved
 one yesterday and then written the comparison, and the comparison is the part with the traps in
 it.
@@ -621,7 +621,7 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows (2470 statements, 552 branches), measured with `coverage run --branch`. The Linux host
+- Coverage is 100 percent branch on Windows (2473 statements, 552 branches), measured with `coverage run --branch`. The Linux host
   has no `coverage` module installed, so the Linux run reports the assertion count only. The Windows-only
   `ctypes` console branches run only on Windows, so no Linux coverage figure exists for them.
 
@@ -721,7 +721,7 @@ More limits, each one a sentence:
 - An HTTP 403 from a proxy or firewall in front of the service is read as a refusal by the service. A layer can then be called closed when the gateway, not the service, refused the stranger, and `caps` exits 0 for a layer that is readable by a browser the gateway lets through.
 - `caps` applies one `--was` to every layer. A `--was` containing `Query` cannot say which layer was readable before, so every layer that answers a stranger is listed as something the run cannot tell, and the run exits 3 when it found nothing else. A public service that always held `Query` therefore never exits 0 under that `--was`. To get a clean result for a Create-only layer, run `caps` on that layer's url with its own `--was`.
 - `diff` does not check that its two snapshots came from the same portal url. Two portals in one `watch --dir` give a false diff with exit 1.
-- That an organization content report is a CSV with one row per item including its access is not cited here and was not exercised. Neither were the ArcGIS Enterprise portal logs or the ArcGIS Online activity report.
+- The organization content report was not exercised, and neither were the ArcGIS Enterprise portal logs or the ArcGIS Online activity report.
 - On a public Create-only view whose anonymous query Esri answers with an error code other than 401, 403, 498 or 499, `caps` exits 3 on every run until that code is known. This is the safe direction. The code Esri returns for a Create-only view was not checked against Esri documentation, so a routine clean run may never exit 0.
 - The README does not cite Esri for the anonymous-refusal shapes: HTTP 401 or 403, or an error object with 498 or 499 inside an HTTP 200. `caps` accepts both, and the closed or open decision rests on observed behaviour only.
 - `caps` reads layers one after another. If a later layer cannot be read, the run exits 2 and reports nothing about the layers already read, so run it again or run it once per layer url.
@@ -732,7 +732,13 @@ More limits, each one a sentence:
 - The Microsoft claim about `GetConsoleMode` is from https://learn.microsoft.com/en-us/windows/console/getconsolemode.
 - The HTTP-status refusals of `caps` (401, 403, 404 and 503) are exercised in process with a synthetic `HTTPError`, not over a socket. Over a socket the self-test tests only HTTP 200 answers.
 - In the `caps` sample block, layer 2 gained both `Update` and `Editing`.
-- A layer that returns an empty `capabilities` string is treated as listing no capability, not as unreadable. With a refused anonymous count, that layer is clean and the run can exit 0.
+- A server that ignores `returnCountOnly` and answers an anonymous query with feature rows but no count is classified unknown, not open, even though a stranger got rows. It fails safe: `caps` reports `cap-flip` as inconclusive when Query was added and exits 3 when nothing else is found, but it ranks below `cap-flip-open`.
+- `caps` run without a token exits 0 when the result is clean and prints only a warning. A layer hidden from anonymous readers fails the description read with exit 2, so the clean exit 0 is not a false clean for that case.
+- The `snapshot`, `diff` and `watch` network paths run in the self-test against an in-process fake opener, not against an `http.server` stub. Only `mirror` and `caps` run against a stub over a socket.
+- `HTTP_TIMEOUT` is a per-socket-operation timeout and response bodies are read without a size cap, so a server that sends bytes slowly or sends a huge body can hold a scheduled run far longer than the timeout.
+- A `ValueError` raised anywhere inside `diff_snapshots` is reported as a sharing level this version does not know, with exit 64, so a malformed hand-edited snapshot is mislabelled. It is still a non-zero exit.
+- A `caps` response whose `error` key is present with a null value next to a valid count is classified unknown, so the run exits 3 rather than reporting open. This is the safe direction and is not tested.
+- A layer whose `capabilities` string is empty is read like a layer that gives none: `caps` reports a gap and exits 3 when the anonymous count is refused. An empty string proves nothing about what the layer allows.
 - `caps` sends the token to whatever host `--service-url` names, so point it only at a service you trust with that token.
 - A proxy or WAF that refuses the default Python `urllib` user agent with HTTP 403 makes the anonymous probe read as closed where a browser would get rows. `caps` can then report a clean result for a layer that is open to browsers.
 - `--was` is split on commas only, so `Create;Query` becomes one unknown capability name. The effect is a loud false alarm, never a false clean.

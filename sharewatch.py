@@ -1031,13 +1031,15 @@ def parse_capabilities(text):
     """A layer's capabilities as {lower-case name: name as written}, or None.
 
     The layer description carries them as one comma separated string, such as
-    "Create,Query,Editing". A layer that gives no string at all is None, which
-    is not the same as an empty string: None means the read proved nothing.
+    "Create,Query,Editing". A layer that gives no string, or a string with no
+    name in it, is None: None means the read proved nothing, so the caller
+    reports a gap and never a clean result.
     """
     if not isinstance(text, str):
         return None
     names = [part.strip() for part in text.split(",")]
-    return dict((name.lower(), name) for name in names if name)
+    found = dict((name.lower(), name) for name in names if name)
+    return found or None
 
 
 # An HTTP status that refuses a stranger, and the codes of an Esri error object
@@ -4234,9 +4236,12 @@ def _self_test():
           and parse_capabilities("QUERY") == {"query": "QUERY"},
           "capabilities are split on commas, trimmed, and compared without "
           "case")
-    check(parse_capabilities("") == {} and parse_capabilities(None) is None
-          and parse_capabilities(["Query"]) is None,
-          "no string at all is None, which is not the empty string")
+    check(parse_capabilities(None) is None
+          and parse_capabilities(["Query"]) is None
+          and parse_capabilities("") is None
+          and parse_capabilities(" , ,") is None,
+          "no string, or a string with no name in it, is None: the read "
+          "proved nothing  <-- pinned defect")
     for status, body, want, label in (
             (None, {"count": 12}, "open", "a count is rows handed to a stranger"),
             (None, {"count": 0}, "open",
@@ -4348,6 +4353,10 @@ def _self_test():
     found, gaps = capability_findings([lay(None, CLOSED)], was_create)
     check(found == [] and gaps == ["layer 0 (Reports) lists no capabilities"],
           "a layer that lists no capabilities is a gap")
+    found, gaps = capability_findings([lay("", CLOSED)], was_create)
+    check(found == [] and gaps == ["layer 0 (Reports) lists no capabilities"],
+          "a layer with an empty capabilities string is a gap, not a clean "
+          "layer  <-- pinned defect")
     found, gaps = capability_findings([lay(None, OPEN)], was_create)
     check([f["kind"] for f in found] == ["cap-flip-open"]
           and "now not listed" in found[0]["detail"] and len(gaps) == 1,
