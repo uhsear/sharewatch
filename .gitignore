@@ -13,3 +13,5 @@ credentials*
 *token*
 .coverage
 .coverage.*
+snaps/
+sharewatch-*.json

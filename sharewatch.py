@@ -1566,7 +1566,7 @@ def _self_test():
         finally:
             sys.stderr = noise
 
-    print("sharewatch self-test: no portal, no network, no credentials")
+    print("sharewatch self-test: no portal, no internet, no credentials")
     print("-" * 68)
 
     # ---- fixtures: one organization, two mornings apart

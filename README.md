@@ -38,7 +38,7 @@ The block below is an excerpt of a real run, in run order. A line that reads `..
 
 ```
 $ python sharewatch.py --self-test
-sharewatch self-test: no portal, no network, no credentials
+sharewatch self-test: no portal, no internet, no credentials
 --------------------------------------------------------------------
 PASS  private is the narrowest level
 PASS  public is the widest level
@@ -194,7 +194,7 @@ git clone https://github.com/uhsear/sharewatch.git
 python sharewatch.py --self-test
 ```
 
-`--self-test` needs no portal, no network and no credentials, so you can check the tool before
+`--self-test` needs no portal, no internet and no credentials, so you can check the tool before
 you point it at an organization. It covers the portal calls as well as the decisions: paging,
 sign-in, the 10,000 row ceiling, an expired token, an HTTP error, a 200 response carrying an
 ArcGIS error envelope, and the `snapshot`, `diff` and `watch` modes end to end are run against a
@@ -204,7 +204,7 @@ The `mirror` mode is run against `http.server` on the loopback addresses `127.0.
 portal) and `127.0.0.2` (the old one), so redirects, the sign-in POST and the host proof go
 through urllib and a real socket. The `caps` mode is run the same way against a stub feature
 service, and its redirect refusal against a second loopback address. The self-test therefore opens loopback sockets, and nothing else.
-It needs no network and no credentials, but it does need a machine where `127.0.0.2` is loopback.
+It needs no internet and no credentials, but it does need a machine where `127.0.0.2` is loopback.
 That holds on Windows and on Linux, which are the two hosts it was run on. It is not run on macOS,
 which binds only `127.0.0.1` by default.
 
@@ -521,7 +521,7 @@ tool does not page past it, so above that the snapshot covers an unknown fractio
 organization. Narrow `--query` and take several snapshots.
 
 A diff that involves a truncated snapshot carries the same warning, because the missing tail
-reads as deletions. That is the false clean day running backwards: instead of hiding 60
+reads as deletions. That is the false clean day running backwards: instead of hiding
 deletions it invents thousands. The diff still runs, since the widenings in it are real.
 
 ## Why not the tools that already exist
@@ -569,8 +569,8 @@ for item_id in old_items:
 ```
 
 That diffs the intersection. An item deleted overnight is not in `new_items`, so it is skipped,
-and an item created overnight is not in `old_items`, so it is never reached. An early version of
-this tool did exactly that and reported a clean day after 60 items were deleted. The fix is to
+and an item created overnight is not in `old_items`, so it is never reached. An early design
+diffed that way, and a day of deletions would have read as clean. The fix is to
 walk the union, and three assertions pin it, including one that a day where everything was
 deleted is not a clean day.
 
@@ -653,7 +653,7 @@ More limits, each one a sentence:
 - The redirect pin compares host names only, so a redirect from https to http, or to another port on the same host, is followed.
 - Tokens travel as query parameters on GET requests, so a proxy or portal access log on the path records them.
 - Esri may serve group and item searches from an index that lags behind edits, so run `mirror` a while after the cutover and use an administrator token on each side.
-- Item titles, owners and group names are printed as the portal returns them, control characters included, so a member of the org can forge finding-looking lines. The exit code is not affected.
+- Item titles, owners, group names and layer names are printed as the portal returns them, control characters included, so a member of the org can forge finding-looking lines. The exit code is not affected.
 - An event lists its first 20 items and counts the rest, so a bulk finding does not name every item.
 - With `--username`, no `SHAREWATCH_PASSWORD` and no terminal on standard input, the run stops with exit 2 and `no password: set SHAREWATCH_PASSWORD`. On Windows, `getpass` reads the console and not standard input, and `isatty()` answers True for the NUL device that a scheduled task may hold. Before this check such a run waited for ever. The check asks `GetStdHandle(STD_INPUT_HANDLE)`, which Microsoft documents as initially the console input buffer, and then `GetConsoleMode`, which Microsoft documents as succeeding for a console input buffer handle. The page for `GetConsoleMode` also says it should not be used to decide whether a handle is a console, and names `NtQueryVolumeInformationFile` instead. This tool uses `GetConsoleMode` once. That it fails for NUL is not stated on the page: it was observed on Windows 11 with a real run with standard input on NUL, which the self-test repeats, and not checked on other Windows versions or on a service with no standard handles.
 - An empty `SHAREWATCH_PASSWORD` or token variable is treated as unset.
@@ -661,10 +661,14 @@ More limits, each one a sentence:
 - `caps` was run against stubs only. It was never run against a live ArcGIS Online or Enterprise service, and the stub's refusals are the stub's own words, not recorded Esri answers.
 - Esri documents the `capabilities` string and the `Query` capability. It does not document that hiding a field adds `Query`. That came from one case, and `caps` reads the result, so it does not depend on the cause.
 - `caps` takes one `--was` for every layer and table of the service. Run it once per layer url when the layers differ.
-- `caps` compares layers and tables, not the service root's own `capabilities` string.
+- `caps` compares layers and tables, not the service root's own `capabilities` string. A view whose root lists `Query` while a layer does not is judged by the anonymous count alone.
 - `caps` probes reads only. A `Create`, `Update` or `Delete` that was added is reported from the list. The tool never writes, so it cannot test an anonymous edit.
 - `caps` does not read the item's sharing. A flip on a view that is not shared to Everyone is `cap-flip`, ranked 60, with the sharing check left to you.
 - A view that held `Query` before is not reported, and that is by design: there is no flip. It also means `caps` is not an audit of every readable view.
+- An anonymous count answered as a float such as `12.0`, as a numeric string or as `null` is unknown, so a server that answers that way gives a gap and exit 3, never a flip. A negative integer such as `-1` is read as a count and so as open, which is loud and not a false clean.
+- The anonymous probe issues only `query?where=1=1&returnCountOnly=true`. A view that refuses count-only queries and serves full queries to strangers is reported as unknown or `cap-flip`, not `cap-flip-open`.
+- `diff` does not check that its first snapshot is the older one. Pass the older file first, or a widening reads as a narrowing: swapped, a private-to-public change prints `item-narrowed` at severity 10 under a reversed date header, still with exit 1.
+- `diff` and `watch` do not compare the url or the query of the two snapshots. Keep one `--dir` per portal and per query, or the diff is a loud false alarm with exit 1, never a false clean.
 - An anonymous count that fails with a 5xx, a timeout, a refused connection or an answer that is not JSON is exit 3. A refusal is HTTP 401 or 403, or an error object with code 401, 403, 498 or 499. Any other 4xx, such as 404, 407, 408 or 429, is exit 3. A layer that answers a stranger in some other way, such as a 200 without `count`, is exit 3 too.
 - The refusal as an error object inside an HTTP 200 is not in the REST reference, and no source for it is cited here. `caps` accepts a refusing status or a refusing code in the body, so it does not depend on which one a server uses.
 - The `where=1=1` count is the only probe. A layer with a definition query counts the rows the definition lets through, and a view with no rows answers a count of 0, which still counts as open.
@@ -688,7 +692,7 @@ More limits, each one a sentence:
 - A `--was` that leaves out a capability the view already held, such as Editing listed beside Create, is reported as `cap-added` and exits 1.
 - A layer that answers a stranger with an error code outside 401, 403, 498 and 499 exits 3, because the tool cannot tell closed from broken. A Create-only view that is not readable may therefore exit 3 with nothing flipped. Which code Esri returns there was not checked offline.
 - `caps` ignores flags that belong to other modes, such as `--dir`, `--out` and `--query`, and `--url` without `--username`, without a word.
-- `.gitignore` does not exclude `sharewatch-*.json`. A snapshot holds item titles, owners and sharing levels for the whole org, so keep `--out` outside any repository.
+- `.gitignore` excludes `snaps/` and `sharewatch-*.json`, which the usage examples write. A snapshot holds item titles, owners and sharing levels for the whole org, so a different `--out` folder inside a clone is not excluded: keep `--out` outside any repository.
 - A snapshot taken with a token that is not an administrator's holds only the items and groups that account can see. `snapshot`, `watch` and `mirror` read `user.role` from `portals/self` and mark such a snapshot `"limited": true`, so the run exits 3 and a later `diff` of that file says so. Only the role `org_admin` counts as an administrator. A custom role with administrator privileges, and a portal that does not describe the user, are treated as limited, so those runs exit 3 although the read was whole.
 - A snapshot taken before this check carries no `limited` key, so a `diff` of an old file from a non-administrator still reads as whole.
 - A usage error prints only the long flag names, and counts any other word it does not show. A one-letter flag is counted like any other word.
@@ -714,7 +718,7 @@ More limits, each one a sentence:
 - Item titles, owners, group names and messages in a `--responses` file are printed raw, so a member of the organization can forge a line that looks like a finding. The exit code is not affected.
 - Snapshot writes are not atomic, and two `--apply` runs in the same second overwrite each other.
 - The 20-mutation spot check of `caps` and the macOS statement that the stub server binds only `127.0.0.1` by default are not exercised by anything in this repository.
-- Portal error messages are printed to standard error as the portal returns them, control characters included, as item titles are.
+- Portal error messages are printed to standard error as the portal returns them, control characters included, as item titles and layer names are.
 - `redact()` matches the raw, `quote_plus` and `quote` forms of a secret only. A server that echoes a token in another encoding, such as HTML entities, is not redacted. Nor is a token that a server echoes percent-encoded twice, for example a login redirect that copies the request URL into `Location`, if the token holds characters outside letters, digits and `-_.`.
 - Text read from a `--responses` file, and the `unexpected <Type>` line, are printed as written. Remove tokens from saved responses before you pass them in.
 - The `--username` path was tested only against a stub that does not check the `Referer` header, and it was not run against a live portal. A portal that rejects a referer-bound token arriving without a `Referer` header would show as exit 2, not as a false clean.
