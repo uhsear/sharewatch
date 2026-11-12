@@ -175,7 +175,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 ...
-614 assertions, 0 failed
+615 assertions, 0 failed
 ```
 
 ## Requirements
@@ -183,9 +183,9 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 614 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 615 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. The self-test also passed with the same 614 assertions on CPython 3.9.25 and 3.10.20 on the
+there. The self-test also passed with the same 615 assertions on CPython 3.9.25 and 3.10.20 on the
 Windows workstation, which is the oldest version it was run on.
 `arcpy` is not used and the `arcgis` package is not needed.
 
@@ -414,7 +414,7 @@ The exit code was 1. Layer 1 is not printed, because nothing changed on it.
 
 How it reads the anonymous count:
 
-- Rows came back: open. A count of 0 is open, because an empty layer still answers.
+- A count came back: open. A body with rows but no count is unknown, because the request asks for a count only. A count of 0 is open, because an empty layer still answers.
 - An HTTP 401 or 403 status, or an error object with code 401, 403, 498 or 499: closed.
 - Anything else is unknown. That covers any other 4xx (such as 404, 407, 408 and 429), a 5xx, a timeout, a refused connection, a page that is not
   JSON and a 200 with neither a count nor an error. Unknown is never called closed. If `Query` was
@@ -459,7 +459,7 @@ groups that is 30 requests instead of 4,000.
 
 ## What it reports
 
-Findings are ranked, worst first, and bulk actions are collapsed.
+Findings are ranked, worst first, and bulk actions are collapsed. The block below is illustrative, not a captured run.
 
 ```
 [100] item-public        9 item(s) by jsmith: org -> public
@@ -681,7 +681,9 @@ More limits, each one a sentence:
 - A `--query`, `--url` or snapshot path that the console code page cannot encode, such as Greek on cp1252, ends as `unexpected UnicodeEncodeError` with exit 2 after the first lines are printed, because only finding lines go through `printable()`.
 - A snapshot file takes the process's default permissions and holds item titles, owners and sharing levels for the whole org, so keep `--out` in a restricted folder.
 - Two `--apply` runs in the same second write the same file name, and the second overwrites the first.
-- The redirect pin and the host comparison ignore the port and the scheme in `caps` and `snapshot`, as they do in `mirror`.
+- The redirect pin and the host comparison ignore the port and the scheme, including ftp, in `caps` and `snapshot`, as they do in `mirror`.
+- A `SHAREWATCH_TOKEN` in the environment is used even when `--username` is given, and the password is then never read.
+- In `watch`, when a snapshot cannot be written and the diff has findings, the exit code is 1 and the write failure appears only on stderr, so a scheduler cannot see that the baseline is going stale.
 - The before state is typed by hand in `--was`, so `caps` never records it. A wrong or incomplete `--was` gives a wrong comparison.
 - A `--was` that leaves out a capability the view already held, such as Editing listed beside Create, is reported as `cap-added` and exits 1.
 - A layer that answers a stranger with an error code outside 401, 403, 498 and 499 exits 3, because the tool cannot tell closed from broken. A Create-only view that is not readable may therefore exit 3 with nothing flipped. Which code Esri returns there was not checked offline.

@@ -4289,7 +4289,10 @@ def _self_test():
              "a 404 error object proves nothing  <-- pinned defect"),
             (None, {"error": {"code": 400}}, "unknown",
              "a 400 error object may be a failing service, not a refusal  "
-             "<-- pinned defect")):
+             "<-- pinned defect"),
+            (None, {"features": [{"attributes": {}}]}, "unknown",
+             "rows with no count are unknown, not open, so the README says "
+             "a count came back  <-- pinned defect")):
         check(probe_verdict(status, body)[0] == want,
               "probe: %s" % label)
     check(probe_verdict(None, {"count": 12})[1] == "returned a count of 12"
@@ -4617,12 +4620,12 @@ def _self_test():
                                                      io.BytesIO(b""))
 
     check(probing(FakeService({}, open_error=http_error(403)))[0] == "closed",
-          "a real HTTP 403 status is closed")
+          "an HTTP 403 status is closed")
     check(probing(FakeService({}, open_error=http_error(503)))[0] == "unknown",
-          "a real HTTP 503 status is unknown  <-- pinned defect")
+          "an HTTP 503 status is unknown  <-- pinned defect")
     check(probing(FakeService({}, open_error=http_error(429)))
           == ("unknown", "HTTP 429"),
-          "a real HTTP 429 status is unknown, not closed  <-- pinned defect")
+          "an HTTP 429 status is unknown, not closed  <-- pinned defect")
     check(probing(FakeService({}, open_error=lambda t: OSError("down")))
           == ("unknown", "no usable answer (OSError)"),
           "no connection is unknown, and the message carries no url")
