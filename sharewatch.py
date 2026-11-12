@@ -119,6 +119,10 @@ TOKEN_ENV_NEW = "SHAREWATCH_NEW_TOKEN"
 # organization, which the REST API reports as its own access value.
 ACCESS_RANK = {"private": 0, "shared": 1, "org": 2, "public": 3}
 
+# Who may join a group, narrowest first. The Esri group page does not document
+# membershipAccess, so these values come from observed responses.
+JOIN_RANK = {"none": 0, "owner": 0, "org": 1, "collaboration": 2}
+
 # The keys that make a saved share answer readable. One of them has to be there.
 SHARE_KEYS = ("notSharedWith", "success", "error")
 
@@ -145,6 +149,7 @@ SEVERITY = {
     "mirror-narrower": 50,    # narrower than the old portal: users lose access
     "mirror-no-group": 48,    # the old item's group does not exist on the new portal
     "mirror-missing": 45,     # an old item with no counterpart on the new portal
+    "mirror-group-missing": 40,  # a group on the old portal, none like it on the new one
     "mirror-group-lost": 45,  # in a group on the old portal, not on the new one
     "mirror-group-extra": 35,  # in a group on the new portal, not on the old one
     "mirror-new-public": 30,  # public on the new portal and not on the old at all
@@ -168,7 +173,7 @@ UNTIMED_KINDS = frozenset(["item-deleted", "item-joined-group", "item-left-group
                            "mirror-public", "mirror-notshared", "mirror-wider",
                            "mirror-narrower", "mirror-no-group", "mirror-missing",
                            "mirror-group-lost", "mirror-group-extra",
-                           "mirror-new-public", "mirror-new-shared",
+                           "mirror-group-missing", "mirror-new-public", "mirror-new-shared",
                            "mirror-ambiguous"])
 
 SNAPSHOT_PREFIX = "sharewatch-"
@@ -670,7 +675,7 @@ def diff_snapshots(old, new, window_minutes=DEFAULT_WINDOW_MINUTES):
                             % (old_access, new_access)))
         old_join = old_group.get("membershipAccess", "org")
         new_join = new_group.get("membershipAccess", "org")
-        if old_join != new_join and new_join == "org":
+        if join_widened(old_join, new_join):
             changes.append(("group-org", "membershipAccess %s -> %s"
                             % (old_join, new_join)))
         for kind, detail in changes:
@@ -783,6 +788,16 @@ class _PinnedRedirect(urllib.request.HTTPRedirectHandler):
                 % (newurl, self.host))
         return urllib.request.HTTPRedirectHandler.redirect_request(
             self, req, fp, code, msg, headers, newurl)
+
+
+def join_widened(old_join, new_join):
+    """True when more people may join. A value not in JOIN_RANK that changed
+    counts as wider, because a skipped change reads as "nothing changed"."""
+    if old_join == new_join:
+        return False
+    if old_join not in JOIN_RANK or new_join not in JOIN_RANK:
+        return True
+    return JOIN_RANK[new_join] > JOIN_RANK[old_join]
 
 
 def _norm(text):
@@ -905,6 +920,8 @@ def _group_events(old, new):
     a title that two groups share on either side is not guessed: it is reported
     as ambiguous, because a skip that says nothing reads as "nothing changed".
     Narrowing of membershipAccess is not reported, as in the single-portal diff.
+    A group only on the old portal that holds no items is reported, because no
+    item event would otherwise show that the new portal lacks it.
     A group with no same-title group on the old portal is reported when it is
     not private, as the single-portal diff reports a new public group: a
     migration script that creates its groups public exposes what it puts in them.
@@ -935,7 +952,7 @@ def _group_events(old, new):
                             % (old_access, new_access)))
         old_join = was.get("membershipAccess", "org")
         new_join = now.get("membershipAccess", "org")
-        if old_join != new_join and new_join == "org":
+        if join_widened(old_join, new_join):
             changes.append(("mirror-wider", "group membershipAccess old %s, "
                             "new %s" % (old_join, new_join)))
         for kind, detail in changes:
@@ -943,6 +960,15 @@ def _group_events(old, new):
                 kind, now.get("owner", ""), detail, items=[], group=gid,
                 group_title=now.get("title", ""),
                 item_count=items_in_group(new, gid)))
+    for norm in sorted(set(old_by) - set(new_by)):
+        for gid, was in old_by[norm]:
+            if items_in_group(old, gid):
+                continue  # its items are reported as mirror-no-group or missing
+            events.append(Event(
+                "mirror-group-missing", was.get("owner", ""),
+                "group only on the old portal, shared %s, no items"
+                % was.get("access", "private"), items=[], group=gid,
+                group_title=was.get("title", ""), item_count=0))
     for norm in sorted(set(new_by) - set(old_by)):
         for gid, now in new_by[norm]:
             level = now.get("access", "private")
@@ -1114,7 +1140,7 @@ def capability_findings(layers, was):
                                        "item's sharing before it reaches "
                                        "Everyone" % (was_text, shown, outcome,
                                                      why)})
-        elif state == "unknown" and not already_open:
+        elif state == "unknown":
             gaps.append("%s: the anonymous query was inconclusive (%s)"
                         % (label, why))
         extra = [name for key, name in added.items() if key != "query"]
@@ -2796,6 +2822,26 @@ def _self_test():
         check(code == 64 and "does not know" in seen,
               "a sharing level this version has never heard of is refused, not "
               "sorted as private and called safe  <-- pinned defect")
+        other = put("other-portal.json", build_snapshot(
+            "https://other.example.org/portal", "2026-09-15T06:00:00Z",
+            {"bulk1": item("bulk1", "jsmith", "org", day1)}, {}, 1, False))
+        code, seen = captured(lambda: main(["diff", older, other]))
+        check(code == 64 and "different portals" in seen
+              and "No sharing changes" not in seen and "item-" not in seen,
+              "two snapshots of different portals are refused, not reported "
+              "as every item deleted or new  <-- pinned defect")
+        same = put("same-portal.json", build_snapshot(
+            PORTAL.upper() + "/", "2026-09-15T06:00:00Z",
+            {"bulk1": item("bulk1", "jsmith", "org", day1)}, {}, 1, False))
+        code, seen = captured(lambda: main(["diff", older, same]))
+        check(code != 64 and "different portals" not in seen,
+              "the same portal typed in another case or with a trailing slash "
+              "is still one portal")
+        check(portal_key({}) == "" and portal_key({"url": "u"}) == ""
+              and portal_key({"url": "HTTPS://Gis.Example.org:8443/Portal/?x=1"})
+              == "gis.example.org/portal",
+              "a snapshot with no usable url has no portal key, and the key "
+              "drops scheme, port, query and case")
         code, seen = captured(lambda: main(
             ["diff", put("cut.json", build_snapshot(
                 "u", "2026-09-14T06:00:00Z", {}, {}, SEARCH_CEILING, True)),
@@ -3805,10 +3851,41 @@ def _self_test():
                            [group("n-g", "org", "owner", title="Staff")]) == []
           and mirror_groups_of([group("o-g", "org", title="Staff")],
                                [group("n-g", "org", title="Staff")]) == []
-          and mirror_groups_of([group("o-g", "org", title="Old")],
-                               [group("n-g", "private", title="New")]) == [],
+          and mirror_groups_of([group("o-g", "org", "collaboration",
+                                      title="Staff")],
+                               [group("n-g", "org", "org", title="Staff")])
+          == []
+          and mirror_groups_of([], [group("n-g", "private", title="New")])
+          == [],
           "an unchanged group, a narrowed membershipAccess and a private group "
-          "with no twin are not reported")
+          "with no twin on the old side are not reported")
+    for was_join, now_join in (("none", "collaboration"),
+                               ("org", "collaboration"), ("org", "invite")):
+        joined = mirror_groups_of(
+            [group("o-g", "org", was_join, title="Staff")],
+            [group("n-g", "org", now_join, title="Staff")])
+        check([ev.kind for ev in joined] == ["mirror-wider"]
+              and ("membershipAccess old %s, new %s" % (was_join, now_join))
+              in joined[0].detail,
+              "membershipAccess %s -> %s is a widening, or a value this "
+              "version does not know, and is reported  <-- pinned defect"
+              % (was_join, now_join))
+    gone = mirror_groups_of([group("o-g", "org", title="Field Editors")], [])
+    check([ev.kind for ev in gone] == ["mirror-group-missing"]
+          and gone[0].item_count == 0 and gone[0].group_title == "Field Editors"
+          and "only on the old portal" in gone[0].detail,
+          "an empty group that exists only on the old portal is reported, not "
+          "passed as a mirror  <-- pinned defect")
+    check(mirror_groups_of([group("o-g", "private", title="Retired")], []) != []
+          and describe(gone)[0].startswith("[ 40] mirror-group-missing")
+          and "(0 item(s) inside)" in describe(gone)[0],
+          "a missing old group is reported at severity 40, private or not")
+    full_old = mirror_diff(
+        group_snap("t", [group("o-g", "org", title="Staff")],
+                   [item("o-i", "o", "org", day1, groups=["o-g"])]),
+        group_snap("t", [], []))[0]
+    check([ev.kind for ev in full_old] == ["mirror-missing"],
+          "an old group that holds items is left to its items' events")
     new_only_public = mirror_groups_of(
         [], [group("n-g", "public", title="Staging")],
         [item("n-i", "o", "private", day1, groups=["n-g"])])
@@ -4342,10 +4419,11 @@ def _self_test():
           == ([], []),
           "a view that was readable before is not a flip when it still is, "
           "whatever the case of the names  <-- pinned defect")
-    check(capability_findings([lay("Query", UNSURE)],
-                              parse_capabilities("Query")) == ([], []),
-          "a view that was readable before has no flip to prove, so an "
-          "inconclusive count is not a gap")
+    found, gaps = capability_findings([lay("Query", UNSURE)],
+                                      parse_capabilities("Query"))
+    check(found == [] and len(gaps) == 1 and "inconclusive" in gaps[0],
+          "an inconclusive count under a --was that holds Query is a gap, not "
+          "a clean result  <-- pinned defect")
     found, gaps = capability_findings([lay("Create", UNSURE)], was_create)
     check(found == [] and len(gaps) == 1 and "inconclusive" in gaps[0],
           "no flip found by a count that gave no answer is a gap, not a clean "
@@ -4983,9 +5061,31 @@ def _write(snapshot, directory, apply_it):
     return path
 
 
+def portal_key(snapshot):
+    """The portal a snapshot was read from, as host plus path, lower case.
+
+    "" when the snapshot carries no url, so a hand-written file is not refused
+    for a field it never had. Scheme, port, query and credentials are left out.
+    """
+    parsed = urllib.parse.urlparse(snapshot.get("url") or "")
+    if not parsed.hostname:
+        return ""
+    return (parsed.hostname + parsed.path.rstrip("/")).lower()
+
+
 def _report(old, new, window_minutes):
     """Print the diff. Returns the exit code: 1 for anything to read, 3 for
-    nothing found by a read that could not prove it, 0 for a proven quiet day."""
+    nothing found by a read that could not prove it, 0 for a proven quiet day,
+    64 for two snapshots of different portals."""
+    old_portal, new_portal = portal_key(old), portal_key(new)
+    if old_portal and new_portal and old_portal != new_portal:
+        # Items are keyed by id, so two portals share none: every item would be
+        # reported deleted or new. A loud false alarm that hides a real change.
+        print("error: the snapshots come from different portals (%s and %s), "
+              "so every item would read as deleted or new. Compare two "
+              "snapshots of one portal, or use mirror for a cutover."
+              % (old_portal, new_portal), file=sys.stderr)
+        return 64
     print("\n%s  ->  %s" % (old.get("taken"), new.get("taken")))
     print("-" * 68)
     for line in truncation_warning(old, new):

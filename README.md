@@ -125,6 +125,8 @@ PASS  the org that was just read is still written when yesterday's file turns ou
 ...
 PASS  a sharing level this version has never heard of is refused, not sorted as private and called safe  <-- pinned defect
 ...
+PASS  two snapshots of different portals are refused, not reported as every item deleted or new  <-- pinned defect
+...
 PASS  an item title a cp1252 console cannot encode is replaced, and the finding still prints  <-- pinned defect
 ...
 PASS  --insecure with --username is refused, because that posts the password down an unverified connection  <-- pinned defect
@@ -149,6 +151,8 @@ PASS  a host refusal is made before any request is sent  <-- pinned defect
 PASS  a new url that answers but declares another host is refused, so a DNS alias left on the old portal is caught  <-- pinned defect
 ...
 PASS  a snapshot run that read fewer items than the portal reported exits 3, not 0  <-- pinned defect
+...
+PASS  an empty group that exists only on the old portal is reported, not passed as a mirror  <-- pinned defect
 ...
 PASS  a public group that exists only on the new portal is reported with the items inside it  <-- pinned defect
 ...
@@ -175,7 +179,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 ...
-616 assertions, 0 failed
+625 assertions, 0 failed
 ```
 
 ## Requirements
@@ -183,9 +187,9 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 616 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 625 assertions on both. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. The self-test also passed with the same 616 assertions on CPython 3.9.25 and 3.10.20 on the
+there. The self-test also passed with the same 625 assertions on CPython 3.9.25 and 3.10.20 on the
 Windows workstation, which is the oldest version it was run on.
 `arcpy` is not used and the `arcgis` package is not needed.
 
@@ -313,6 +317,7 @@ old 127.0.0.2  ->  new 127.0.0.1 (verified host 127.0.0.1)
 | 65 | `mirror-wider` | Wider on the new portal than on the old, short of public. |
 | 50 | `mirror-narrower` | Narrower on the new portal. Users lose access. |
 | 48 | `mirror-no-group` | The old item's group does not exist on the new portal, so no share into it can land. |
+| 40 | `mirror-group-missing` | A group on the old portal that holds no items and has no same-title group on the new one. A group that holds items is left to its items' events. |
 | 45 | `mirror-missing` | An old item with no counterpart on the new portal. |
 | 45 | `mirror-group-lost` | In a group on the old portal and not on the new one. |
 | 35 | `mirror-group-extra` | In a group on the new portal and not on the old one. |
@@ -621,19 +626,24 @@ too.
 - The empty `groups` call has no signature in a saved response, so `--responses` cannot see it.
   The live comparison does.
 - A mirror read costs one request per group on each portal, the same as the other modes.
-- Coverage is 100 percent branch on Windows (2473 statements, 552 branches), measured with `coverage run --branch`. The Linux host
+- Coverage is 100 percent branch on Windows (2510 statements, 568 branches), measured with `coverage run --branch`. The Linux host
   has no `coverage` module installed, so the Linux run reports the assertion count only. The Windows-only
   `ctypes` console branches run only on Windows, so no Linux coverage figure exists for them.
 
 More limits, each one a sentence:
 
+- A `caps` run whose `--was` holds `Query` and whose anonymous count gave no usable answer reports that layer as something it cannot tell and exits 3.
+- A `watch` run that finds the newest snapshot in `--dir` came from another portal still writes the fresh snapshot under `--apply`, then exits 64 without a diff.
+- A missing `access` value in a portal record is read as `private`, the safest level, and not as unknown. Real portal responses carry the field.
+- The claim that an administrator's search returns every private item is not confirmed on the Esri search page. If it returns fewer, a snapshot is limited while the tool calls it whole.
+- The 498 and 499 error-object refusal and the HTTP 401 or 403 refusal for an anonymous layer query are observed behaviour. No Esri page is cited for them.
 - A mutation run changed the pure core and the command line 443 times. After this round the item type, the secret guard in `redact` and the anonymous group search are pinned. The survivors left are equivalent or cosmetic.
 - A spot check of the `caps` code changed it 20 times by hand. The first run left one survivor, the ranking sort, and a fixture where layer order and severity order disagree now pins it. Of 22 caps mutants tried by hand later, 20 turned the self-test red and 2 survived, both listed below. It is a sample, not a sweep.
 - Those survivors are the `__main__` guard, the error message format, the progress echo, the rule line width, the token expiration of 60 and `describe()` choosing a group id over its title.
 - Four boundaries would not turn the self-test red: the collapse window arithmetic, the 20-item list cap in `describe`, `--window-minutes 0` being accepted, and the detail text of `mirror-new-shared` for an item.
 - A group that exists only on the new portal is reported when it is public or org-wide, and not when it is private.
-- A group that exists only on the old portal and holds no items is not reported, so that run can say the new portal shares what the old one did.
-- Mirror reports a group's `membershipAccess` widening only when the new value is `org`. A move from `none` to `collaboration` is not reported.
+- A group that exists only on the old portal is reported as `mirror-group-missing` when it holds no items. One that holds items is not reported on its own, because its items are reported as `mirror-no-group` or `mirror-missing`.
+- Mirror and `diff` rank `membershipAccess` as `none` and `owner`, then `org`, then `collaboration`. That order is read from observed responses, not from Esri. A move up the order is reported, and so is a change to or from a value outside the list. A move down is not reported.
 - Reading a null `membershipAccess` as `org` comes from observed responses. The Esri group page does not document the field.
 - Titles are paired after trimming and lower-casing only. Unicode normal forms, and `ss` against the German eszett, are not equated, so those items read as one missing item and one new item.
 - `mirror` ignores `--url`, `--username`, `--out` and `--dir` without a word. A mirror run with no token variable and no `--old-username` reads that portal anonymously and exits 3 or reports many missing items.
@@ -668,7 +678,7 @@ More limits, each one a sentence:
 - An anonymous count answered as a float such as `12.0`, as a numeric string or as `null` is unknown, so a server that answers that way gives a gap and exit 3, never a flip. A negative integer such as `-1` is read as a count and so as open, which is loud and not a false clean.
 - The anonymous probe issues only `query?where=1=1&returnCountOnly=true`. A view that refuses count-only queries and serves full queries to strangers is reported as unknown or `cap-flip`, not `cap-flip-open`.
 - `diff` does not check that its first snapshot is the older one. Pass the older file first, or a widening reads as a narrowing: swapped, a private-to-public change prints `item-narrowed` at severity 10 under a reversed date header, still with exit 1.
-- `diff` and `watch` do not compare the url or the query of the two snapshots. Keep one `--dir` per portal and per query, or the diff is a loud false alarm with exit 1, never a false clean.
+- `diff` and `watch` refuse two snapshots whose recorded url differs in host or path (exit 64). They do not compare the query, so keep one `--dir` per query, or the diff is a loud false alarm with exit 1, never a false clean. A snapshot with no url is not refused.
 - An anonymous count that fails with a 5xx, a timeout, a refused connection or an answer that is not JSON is exit 3. A refusal is HTTP 401 or 403, or an error object with code 401, 403, 498 or 499. Any other 4xx, such as 404, 407, 408 or 429, is exit 3. A layer that answers a stranger in some other way, such as a 200 without `count`, is exit 3 too.
 - The refusal as an error object inside an HTTP 200 is not in the REST reference, and no source for it is cited here. `caps` accepts a refusing status or a refusing code in the body, so it does not depend on which one a server uses.
 - The `where=1=1` count is the only probe. A layer with a definition query counts the rows the definition lets through, and a view with no rows answers a count of 0, which still counts as open.
