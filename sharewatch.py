@@ -259,8 +259,19 @@ def is_http_url(url):
     return "@" not in parts.netloc and not any(c in url for c in "?#;")
 
 
+_HOSTILE = {code: "?" for code in (
+    list(range(0x20)) + list(range(0x7f, 0xa0))
+    + [0x200b, 0x200c, 0x200d, 0x2028, 0x2029, 0xfeff]
+    + list(range(0x202a, 0x202f)) + list(range(0x2066, 0x206a)))}
+
+
 def printable(text, encoding):
     """Make one line safe for a console that cannot encode it.
+
+    Item titles, owners, group names and layer names come from the portal, so
+    any member of the org chooses them. Control, bidi and zero-width characters
+    are printed as ? so a title cannot clear the line, move the cursor or
+    reorder the text to forge a finding.
 
     ArcGIS Pro runs on Windows, where stdout is cp1252 unless somebody changed
     it, and one item whose title held a character that code page has no room
@@ -268,6 +279,7 @@ def printable(text, encoding):
     findings. A replaced character loses a letter; the crash lost every finding
     under it.
     """
+    text = text.translate(_HOSTILE)
     if not encoding:
         return text
     try:
@@ -1956,6 +1968,15 @@ def _self_test():
           "a stream that reports no encoding is left alone")
     check(printable(wide, "not-an-encoding") == wide,
           "an unknown console encoding is left alone rather than raised on")
+    hostile = "ok\x1b[2K\x0dFAKE\u202e\u200b\u2066\ufeff\x7f\x85\n"
+    check(printable(hostile, "utf-8") == "ok?[2K?FAKE???????",
+          "escape, carriage return, newline, bidi, zero-width and other control "
+          "characters in a portal title print as ?, never raw  "
+          "<-- pinned defect")
+    check(printable(hostile, None) == printable(hostile, "utf-8"),
+          "a stream with no encoding gets the same scrubbed line")
+    check(printable("Caf\xe9 \u6c34\x09map", "utf-8") == "Caf\xe9 \u6c34?map",
+          "printable text and non-ascii letters pass through, a tab does not")
 
     # ---- snapshot files
     when = datetime.datetime(2026, 9, 15, 6, 0, 0)
@@ -2785,6 +2806,19 @@ def _self_test():
               "the diff header says which two mornings it compared")
         check("item-public" in seen and "9 item(s) by jsmith" in seen,
               "the collapsed bulk share is what the report leads with")
+        evil_old = build_snapshot("https://example.maps.arcgis.com",
+                                  "2026-09-14T06:00:00Z", {"e1": item(
+                                      "e1", "o\x07wn", "private", day1,
+                                      title="ok\x1b[2K\x0dFAKE\u202e")}, {}, 1, False)
+        evil_new = json.loads(json.dumps(evil_old))
+        evil_new["taken"] = "2026-09-15T06:00:00Z"
+        evil_new["items"]["e1"]["access"] = "public"
+        code, seen = captured(lambda: main(["diff", put("evil1.json", evil_old),
+                                            put("evil2.json", evil_new)]))
+        check(code == 1 and "ok?[2K?FAKE?" in seen and "o?wn" in seen
+              and not any(c in seen for c in "\x1b\x0d\x07\u202e"),
+              "a hostile item title and owner reach the diff report with no "
+              "control or bidi character  <-- pinned defect")
         code, seen = captured(lambda: main(["diff", older, older]))
         check(code == 0 and "No sharing changes" in seen,
               "a quiet diff exits 0 and says so in one line")

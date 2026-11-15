@@ -179,7 +179,7 @@ PASS  the harness records a false check, a missing exception, a wrong exception,
 PASS  a failed tally lists the failure and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and does not exit
 ...
-625 assertions, 0 failed
+629 assertions, 0 failed
 ```
 
 ## Requirements
@@ -187,9 +187,9 @@ PASS  importing the file runs nothing and does not exit
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`,
 `argparse`, `datetime`, `getpass`, `ctypes`, and `tempfile`, `shutil`, `subprocess`, `http.server`,
 `socketserver`, `threading`, `contextlib` and `runpy` in the self-test. It ran on Python 3.13
-on Windows and Python 3.12 on Linux, with 625 assertions on both. Nothing outside the standard
+on Windows and Python 3.12 on Linux, with 625 assertions on both before the control-character scrub, and 629 on Python 3.13 on Windows after it. Nothing outside the standard
 library is used, so it should run on the Python that ships with ArcGIS Pro, but it was not run
-there. The self-test also passed with the same 625 assertions on CPython 3.9.25 and 3.10.20 on the
+there. The self-test also passed with the same 625 assertions (before the scrub) on CPython 3.9.25 and 3.10.20 on the
 Windows workstation, which is the oldest version it was run on.
 `arcpy` is not used and the `arcgis` package is not needed.
 
@@ -664,7 +664,6 @@ More limits, each one a sentence:
 - The redirect pin compares host names only, so a redirect from https to http, or to another port on the same host, is followed.
 - Tokens travel as query parameters on GET requests, so a proxy or portal access log on the path records them.
 - Esri may serve group and item searches from an index that lags behind edits, so run `mirror` a while after the cutover and use an administrator token on each side.
-- Item titles, owners, group names and layer names are printed as the portal returns them, control characters included, so a member of the org can forge finding-looking lines. The exit code is not affected.
 - An event lists its first 20 items and counts the rest, so a bulk finding does not name every item.
 - With `--username`, no `SHAREWATCH_PASSWORD` and no terminal on standard input, the run stops with exit 2 and `no password: set SHAREWATCH_PASSWORD`. On Windows, `getpass` reads the console and not standard input, and `isatty()` answers True for the NUL device that a scheduled task may hold. Before this check such a run waited for ever. The check asks `GetStdHandle(STD_INPUT_HANDLE)`, which Microsoft documents as initially the console input buffer, and then `GetConsoleMode`, which Microsoft documents as succeeding for a console input buffer handle. The page for `GetConsoleMode` also says it should not be used to decide whether a handle is a console, and names `NtQueryVolumeInformationFile` instead. This tool uses `GetConsoleMode` once. That it fails for NUL is not stated on the page: it was observed on Windows 11 with a real run with standard input on NUL, which the self-test repeats, and not checked on other Windows versions or on a service with no standard handles.
 - An empty `SHAREWATCH_PASSWORD` or token variable is treated as unset.
@@ -730,10 +729,10 @@ More limits, each one a sentence:
 - A `--query` or `--url` holding characters the console code page cannot encode, such as Greek on cp1252, stops with `unexpected UnicodeEncodeError` and exit 2 after some output.
 - A `--service-url` such as `.../FeatureServer?f=json` is refused with exit 64 like any url with a query string.
 - The redirect pin compares host names only. A same-host redirect from `https` to `http`, or to another port, is followed and carries the token in clear text.
-- Item titles, owners, group names and messages in a `--responses` file are printed raw, so a member of the organization can forge a line that looks like a finding. The exit code is not affected.
+- Item titles, owners, group names and messages in a `--responses` file are printed with control, bidi and zero-width characters replaced by `?`. Plain printable text is still shown as written, so a member of the organization can type a title that looks like a finding. The exit code is not affected.
 - Snapshot writes are not atomic, and two `--apply` runs in the same second overwrite each other.
 - The 20-mutation spot check of `caps` and the macOS statement that the stub server binds only `127.0.0.1` by default are not exercised by anything in this repository.
-- Portal error messages are printed to standard error as the portal returns them, control characters included, as item titles and layer names are.
+- Portal error messages are printed to standard error as the portal returns them, control characters included. Only the report lines go through the scrub.
 - `redact()` matches the raw, `quote_plus` and `quote` forms of a secret only. A server that echoes a token in another encoding, such as HTML entities, is not redacted. Nor is a token that a server echoes percent-encoded twice, for example a login redirect that copies the request URL into `Location`, if the token holds characters outside letters, digits and `-_.`.
 - Text read from a `--responses` file, and the `unexpected <Type>` line, are printed as written. Remove tokens from saved responses before you pass them in.
 - The `--username` path was tested only against a stub that does not check the `Referer` header, and it was not run against a live portal. A portal that rejects a referer-bound token arriving without a `Referer` header would show as exit 2, not as a false clean.
@@ -762,7 +761,6 @@ More limits, each one a sentence:
 - A proxy or WAF that refuses the default Python `urllib` user agent with HTTP 403 makes the anonymous probe read as closed where a browser would get rows. `caps` can then report a clean result for a layer that is open to browsers.
 - `--was` is split on commas only, so `Create;Query` becomes one unknown capability name. The effect is a loud false alarm, never a false clean.
 - Extra positional words are silently ignored by `snapshot`, `watch`, `mirror` and `caps`, so a mistyped word is not reported. The word is not echoed.
-- A control character in an item title can clear the screen, so a member of the org can push real findings out of view in a terminal. The exit code is still 1, so read it, or redirect the output to a file.
 - An item whose `access` field is absent reads as private in both snapshots, so a public item with no `access` would never be reported. Esri search sends `access` for every item, and this was not run live.
 - The tool writes no CSV. A title that starts with `=`, `+`, `-` or `@` is printed as it is, so a report you paste into a spreadsheet can run it as a formula.
 
